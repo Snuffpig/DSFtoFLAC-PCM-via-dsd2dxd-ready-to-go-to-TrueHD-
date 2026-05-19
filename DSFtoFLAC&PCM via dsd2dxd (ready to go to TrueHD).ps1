@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
+    Version: v1.0.1
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -19,7 +20,7 @@
       Phase 3  — Parallel sample-accurate FLAC slicing with metadata from source DSFs
 
     -TrueHD MODE (adds):
-      Phase 4 — Channel routing → discrete mono pcm_s24le WAV stems for TrueHD mux
+      Phase 4 — Channel routing & Chapter generation → discrete mono pcm_s24le WAV stems and perfectly aligned MKVToolNix-compatible chapters for TrueHD muxing
 
     Phase 5 — Output inventory (all monolithic files are always retained)
 
@@ -106,7 +107,7 @@ $FLAC_LEVEL  = 8
 $STEM_CODEC  = 'pcm_s24le'
 
 # Number of threads for CPU-bound parallel operations (Phase 2 decimation).
-# Uncapped to maximize CPU utilization across all available cores.
+# Uncapped to maximise CPU utilisation across all available cores.
 $THROTTLE       = [Environment]::ProcessorCount
 
 # Phase 3 FLAC slicing is I/O-bound: all threads read from the same monolithic WAV.
@@ -123,9 +124,24 @@ $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
 if ($scriptDir) { Set-Location $scriptDir }
 
 Write-Host ""
-Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
-Write-Host "  DSF → Gapless FLAC & TrueHD Stems via dsd2dxd" -ForegroundColor Cyan
-Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host " ╔══════════════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
+Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
+Write-Host "  DSF" -NoNewline -ForegroundColor White
+Write-Host " → " -NoNewline -ForegroundColor DarkCyan
+Write-Host "GAPLESS FLAC & TRUEHD STEMS                       " -NoNewline -ForegroundColor Cyan
+Write-Host "║" -ForegroundColor DarkCyan
+Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
+Write-Host "  Audiophile decimation & gapless slicing pipeline        " -NoNewline -ForegroundColor Gray
+Write-Host "║" -ForegroundColor DarkCyan
+Write-Host " ╟──────────────────────────────────────────────────────────╢" -ForegroundColor DarkCyan
+Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
+Write-Host "  Engine: " -NoNewline -ForegroundColor DarkGray
+Write-Host "dsd2dxd v1.0.1" -NoNewline -ForegroundColor White
+Write-Host "                " -NoNewline
+Write-Host "Parallel: " -NoNewline -ForegroundColor DarkGray
+Write-Host "Active" -NoNewline -ForegroundColor Green
+Write-Host "  ║" -ForegroundColor DarkCyan
+Write-Host " ╚══════════════════════════════════════════════════════════╝" -ForegroundColor DarkCyan
 Write-Host ""
 
 foreach ($tool in @('dsd2dxd','ffmpeg')) {
@@ -177,8 +193,10 @@ $fileCount    = $dsfFiles.Count
 $monolithDsf  = Join-Path $scriptDir 'Album_Monolithic.dsf'
 $monolithWav  = Join-Path $scriptDir 'Album_Monolithic.wav'
 
-Write-Host "Found $fileCount DSF track(s) — processing in sorted order:" -ForegroundColor Green
-$dsfFiles | ForEach-Object { Write-Host "  $($_.Name)" -ForegroundColor DarkGray }
+Write-Host "  Found " -NoNewline -ForegroundColor Gray
+Write-Host $fileCount -NoNewline -ForegroundColor Cyan
+Write-Host " DSF track(s) — processing in sorted order:" -ForegroundColor Gray
+$dsfFiles | ForEach-Object { Write-Host "    $($_.Name)" -ForegroundColor Gray }
 Write-Host ""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -207,8 +225,23 @@ $PASS = 'PASS'; $WARN = 'WARN'; $FAIL = 'FAIL'
 
 function Write-Check {
     param([string]$Label, [string]$Status, [string]$Detail)
+    Write-Host "  [" -NoNewline -ForegroundColor DarkGray
     $col = switch ($Status) { 'PASS'{'Green'} 'WARN'{'Yellow'} 'FAIL'{'Red'} }
-    Write-Host ("  [{0}] {1,-30} {2}" -f $Status, $Label, $Detail) -ForegroundColor $col
+    Write-Host $Status -NoNewline -ForegroundColor $col
+    Write-Host "] " -NoNewline -ForegroundColor DarkGray
+    Write-Host ("{0,-30} " -f $Label) -NoNewline -ForegroundColor Gray
+    $detailText = $Detail
+    if ($Detail -like '=*') {
+        Write-Host "= " -NoNewline -ForegroundColor DarkGray
+        $detailText = $Detail.Substring(2).Trim()
+    }
+    if ($detailText -match '^([^\(]+)(.*)$') {
+        Write-Host $Matches[1].Trim() -NoNewline -ForegroundColor Cyan
+        if ($Matches[2]) { Write-Host " $($Matches[2])" -NoNewline -ForegroundColor DarkGray }
+    } else {
+        Write-Host $detailText -NoNewline -ForegroundColor Cyan
+    }
+    Write-Host ""
 }
 
 function Get-AsciiAt {
@@ -241,8 +274,25 @@ function Format-Bytes {
     return "$Bytes bytes"
 }
 
+# Format seconds precisely as HH:MM:SS.mmm for MKVToolNix chapters.
+function Format-ChapterTs {
+    param([double]$Seconds)
+    $ms = [math]::Round($Seconds * 1000)
+    $t = [TimeSpan]::FromMilliseconds($ms)
+    return "{0:D2}:{1:D2}:{2:D2}.{3:D3}" -f [int][math]::Floor($t.TotalHours), $t.Minutes, $t.Seconds, $t.Milliseconds
+}
+
+# Extract and clean up track filenames into beautiful chapter titles.
+function Get-ChapterTitle {
+    param([string]$FileName)
+    $title = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
+    $pattern = '^\s*(?:(?:(?:CD|Disc|Disk|Vol|Volume|Part)\s*\d+\s*[-._]?\s*\d+\s*[-.]?\s*)|(?:\d+-\d+\s*[-._]?\s*)|(?:\d+\s*[-.]\s*)|(?:\d{2,}\s+))'
+    $title = $title -replace $pattern, ''
+    return $title.Trim()
+}
+
 # Inline C# DSP helper — compiled once at startup via Add-Type.
-# PowerShell's interpreted for-loop is too slow for high-frequency sample math:
+# PowerShell's interpreted for-loop is too slow for high-frequency sample maths:
 # a 250ms 5.1/96kHz fade requires ~860K iterations with bitwise ops per pass.
 # This C# class executes the identical linear fade on the CLR in milliseconds.
 #
@@ -329,7 +379,7 @@ public static class DspHelper {
 
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "── Phase 0: Binary Diagnostic ──────────────────────────────" -ForegroundColor DarkCyan
+Write-Host " ── Phase 0: Binary Diagnostic ─────────────────────────────" -ForegroundColor DarkCyan
 Write-Host ""
 
 $globalFail    = $false
@@ -347,7 +397,13 @@ for ($i = 0; $i -lt $fileCount; $i++) {
     $isFinal = ($i -eq $fileCount - 1)
     $roleTag = if ($isFinal) { ' ← FINAL track' } else { '' }
 
-    Write-Host "─── [$($i+1)/$fileCount] $($track.Name)$roleTag" -ForegroundColor White
+    Write-Host "  ─── " -NoNewline -ForegroundColor DarkCyan
+    Write-Host "[" -NoNewline -ForegroundColor DarkGray
+    Write-Host "$($i+1)/$fileCount" -NoNewline -ForegroundColor Cyan
+    Write-Host "] " -NoNewline -ForegroundColor DarkGray
+    Write-Host $track.Name -NoNewline -ForegroundColor White
+    if ($roleTag) { Write-Host $roleTag -NoNewline -ForegroundColor Green }
+    Write-Host ""
     Write-Host ""
 
     # FileStream is wrapped in try/finally so it is always closed even if a
@@ -592,7 +648,7 @@ for ($i = 0; $i -lt $fileCount; $i++) {
 }
 
 # Cross-file consistency
-Write-Host "─── Cross-file consistency" -ForegroundColor White
+Write-Host "  ─── Cross-file consistency ───────────────────────────────" -ForegroundColor DarkCyan
 Write-Host ""
 
 # Guard against an empty consistency list (can only happen if fileCount was 0,
@@ -624,7 +680,7 @@ if ($albumSampleHz -gt 0) {
 }
 Write-Host ""
 
-Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host " ════════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
 if ($globalFail) {
     Write-Host "  VERDICT: FAIL — Aborting." -ForegroundColor Red
     Write-Host "  Resolve the FAIL items above before proceeding." -ForegroundColor Red
@@ -649,7 +705,7 @@ if ($globalFail) {
         }
     }
 }
-Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host " ════════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
 Write-Host ""
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -852,7 +908,7 @@ if ($discCount -gt 1) {
 # $discDsfPaths is populated here and consumed by Phase 2.
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "── Phase 1: Binary Surgery ─────────────────────────────────" -ForegroundColor DarkCyan
+Write-Host " ── Phase 1: Binary Surgery ────────────────────────────────" -ForegroundColor DarkCyan
 Write-Host ""
 
 # Read master header from first file — format fields identical across all files.
@@ -889,11 +945,32 @@ $chanLayout = switch ($channelType) {
     }
 }
 
-Write-Host "  Master header from  : $($dsfFiles[0].Name)" -ForegroundColor Gray
-Write-Host "  Channel type        : $channelType ($chanLayout)" -ForegroundColor Gray
-Write-Host "  Channel count       : $channelCount" -ForegroundColor Gray
-Write-Host "  Block sz / channel  : $(Format-N $blockSzPerChan) bytes" -ForegroundColor Gray
-Write-Host "  Interleaved block   : $(Format-N $blockSize) bytes" -ForegroundColor Gray
+Write-Host "  Master header from  " -NoNewline -ForegroundColor Gray
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "$($dsfFiles[0].Name)" -ForegroundColor White
+
+Write-Host "  Channel type        " -NoNewline -ForegroundColor Gray
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+if ($null -ne $chanLayout) {
+    Write-Host "$channelType" -NoNewline -ForegroundColor Cyan
+    Write-Host " ($chanLayout)" -ForegroundColor DarkGray
+} else {
+    Write-Host "$channelType" -ForegroundColor Cyan
+}
+
+Write-Host "  Channel count       " -NoNewline -ForegroundColor Gray
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host $channelCount -ForegroundColor Cyan
+
+Write-Host "  Block sz / channel  " -NoNewline -ForegroundColor Gray
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "$(Format-N $blockSzPerChan)" -NoNewline -ForegroundColor Cyan
+Write-Host " bytes" -ForegroundColor Gray
+
+Write-Host "  Interleaved block   " -NoNewline -ForegroundColor Gray
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "$(Format-N $blockSize)" -NoNewline -ForegroundColor Cyan
+Write-Host " bytes" -ForegroundColor Gray
 Write-Host ""
 
 # $discDsfPaths[d] = monolithic DSF path written for disc group d.
@@ -907,7 +984,12 @@ for ($d = 0; $d -lt $discCount; $d++) {
     $discDsfPaths.Add($discDsfPath)
 
     $discLabel = if ($discCount -gt 1) { "Disc $($d+1)/$discCount" } else { 'Album' }
-    Write-Host "  [$discLabel] $discTrackCount track(s) → $(Split-Path $discDsfPath -Leaf)" -ForegroundColor White
+    Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+    Write-Host $discLabel -NoNewline -ForegroundColor Cyan
+    Write-Host "] " -NoNewline -ForegroundColor DarkGray
+    Write-Host $discTrackCount -NoNewline -ForegroundColor Cyan
+    Write-Host " track(s) → " -NoNewline -ForegroundColor Gray
+    Write-Host $(Split-Path $discDsfPath -Leaf) -ForegroundColor White
     Write-Host ""
 
     # Reset all per-disc buffers — never carry state between disc groups.
@@ -930,7 +1012,12 @@ for ($d = 0; $d -lt $discCount; $d++) {
             $track      = $discTracks[$i]
             $isFinal    = ($i -eq $discTrackCount - 1)
             $trackLabel = if ($isFinal) { '(final track)' } else { '' }
-            Write-Host "    [$($i+1)/$discTrackCount] $($track.Name) $trackLabel" -ForegroundColor White
+            Write-Host "    [" -NoNewline -ForegroundColor DarkGray
+            Write-Host "$($i+1)/$discTrackCount" -NoNewline -ForegroundColor Cyan
+            Write-Host "] " -NoNewline -ForegroundColor DarkGray
+            Write-Host $track.Name -NoNewline -ForegroundColor White
+            if ($trackLabel) { Write-Host " $trackLabel" -NoNewline -ForegroundColor Green }
+            Write-Host ""
 
             $fs = [System.IO.FileStream]::new($track.FullName, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read, 4MB)
             try {
@@ -1015,23 +1102,50 @@ for ($d = 0; $d -lt $discCount; $d++) {
                         $buffered     -= $blockSzPerChan
                     }
                 }
-                if ($paddingBytes -gt 0 -and $albumSampleHz -gt 0) {
-                    $padMs = [math]::Round($paddingBytes * 8 / $albumSampleHz * 1000, 4)
-                    Write-Host "      Payload streamed : $(Format-N ($validBytesPerChan * $channelCount)) valid bytes ($(Format-Bytes ($validBytesPerChan * $channelCount)))" -ForegroundColor DarkGray
-                    Write-Host "      Boundary excised : $(Format-N $paddingBytes) bytes/ch (${padMs}ms)" -ForegroundColor DarkGreen
-                } elseif ($paddingBytes -gt 0) {
-                    Write-Host "      Payload streamed : $(Format-N ($validBytesPerChan * $channelCount)) valid bytes ($(Format-Bytes ($validBytesPerChan * $channelCount)))" -ForegroundColor DarkGray
-                    Write-Host "      Boundary excised : $(Format-N $paddingBytes) bytes/ch" -ForegroundColor DarkGreen
-                } else {
-                    Write-Host "      Payload streamed : $(Format-N $payloadBytes) bytes ($(Format-Bytes $payloadBytes)) (no padding)" -ForegroundColor DarkGray
-                }
+                    if ($paddingBytes -gt 0 -and $albumSampleHz -gt 0) {
+                        $padMs = [math]::Round($paddingBytes * 8 / $albumSampleHz * 1000, 4)
+                        Write-Host "      Payload streamed : " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-N ($validBytesPerChan * $channelCount))" -NoNewline -ForegroundColor Cyan
+                        Write-Host " valid bytes (" -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-Bytes ($validBytesPerChan * $channelCount))" -NoNewline -ForegroundColor Cyan
+                        Write-Host ")" -ForegroundColor DarkGray
+                        
+                        Write-Host "      Boundary excised : " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-N $paddingBytes)" -NoNewline -ForegroundColor Green
+                        Write-Host " bytes/ch (" -NoNewline -ForegroundColor DarkGray
+                        Write-Host "${padMs}ms" -NoNewline -ForegroundColor Green
+                        Write-Host ")" -ForegroundColor DarkGray
+                    } elseif ($paddingBytes -gt 0) {
+                        Write-Host "      Payload streamed : " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-N ($validBytesPerChan * $channelCount))" -NoNewline -ForegroundColor Cyan
+                        Write-Host " valid bytes (" -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-Bytes ($validBytesPerChan * $channelCount))" -NoNewline -ForegroundColor Cyan
+                        Write-Host ")" -ForegroundColor DarkGray
+                        
+                        Write-Host "      Boundary excised : " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-N $paddingBytes)" -NoNewline -ForegroundColor Green
+                        Write-Host " bytes/ch" -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "      Payload streamed : " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-N $payloadBytes)" -NoNewline -ForegroundColor Cyan
+                        Write-Host " bytes (" -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$(Format-Bytes $payloadBytes)" -NoNewline -ForegroundColor Cyan
+                        Write-Host ") (no padding)" -ForegroundColor DarkGray
+                    }
                 $mapEntry = $trackMap | Where-Object { $_.DsfPath -eq $track.FullName } | Select-Object -First 1
-                if ($mapEntry) {
-                    $tsStart = Format-Ts ($mapEntry.PcmStart / $PCM_RATE)
-                    $tsEnd   = Format-Ts ($mapEntry.PcmEnd / $PCM_RATE)
-                    Write-Host "      PCM target range : Sample $(Format-N $mapEntry.PcmStart) → $(Format-N $mapEntry.PcmEnd)  ($tsStart → $tsEnd)" -ForegroundColor DarkCyan
-                    Write-Host ""
-                }
+                    if ($mapEntry) {
+                        $tsStart = Format-Ts ($mapEntry.PcmStart / $PCM_RATE)
+                        $tsEnd   = Format-Ts ($mapEntry.PcmEnd / $PCM_RATE)
+                        Write-Host "      PCM target range : " -NoNewline -ForegroundColor DarkGray
+                        Write-Host "Sample " -NoNewline -ForegroundColor Gray
+                        Write-Host "$(Format-N $mapEntry.PcmStart)" -NoNewline -ForegroundColor Cyan
+                        Write-Host " → " -NoNewline -ForegroundColor Gray
+                        Write-Host "$(Format-N $mapEntry.PcmEnd)" -NoNewline -ForegroundColor Cyan
+                        Write-Host "  (" -NoNewline -ForegroundColor DarkGray
+                        Write-Host "$tsStart → $tsEnd" -NoNewline -ForegroundColor Cyan
+                        Write-Host ")" -ForegroundColor DarkGray
+                        Write-Host ""
+                    }
             } finally { $fs.Close() }
         }
 
@@ -1050,9 +1164,15 @@ for ($d = 0; $d -lt $discCount; $d++) {
             $totalPayload += $blockSize
             if ($albumSampleHz -gt 0) {
                 $padMs = [math]::Round(($blockSzPerChan - $buffered) * 8 / $albumSampleHz * 1000, 4)
-                Write-Host "    Final flush : $(Format-N ($blockSzPerChan - $buffered)) bytes/ch 0x69 silence (${padMs}ms)" -ForegroundColor DarkGray
+                Write-Host "    Final flush      : " -NoNewline -ForegroundColor DarkGray
+                Write-Host "$(Format-N ($blockSzPerChan - $buffered))" -NoNewline -ForegroundColor Cyan
+                Write-Host " bytes/ch 0x69 silence (" -NoNewline -ForegroundColor DarkGray
+                Write-Host "${padMs}ms" -NoNewline -ForegroundColor Yellow
+                Write-Host ")" -ForegroundColor DarkGray
             } else {
-                Write-Host "    Final flush : $(Format-N ($blockSzPerChan - $buffered)) bytes/ch 0x69 silence" -ForegroundColor DarkGray
+                Write-Host "    Final flush      : " -NoNewline -ForegroundColor DarkGray
+                Write-Host "$(Format-N ($blockSzPerChan - $buffered))" -NoNewline -ForegroundColor Cyan
+                Write-Host " bytes/ch 0x69 silence" -ForegroundColor DarkGray
             }
         }
 
@@ -1063,8 +1183,15 @@ for ($d = 0; $d -lt $discCount; $d++) {
         [Array]::Copy([BitConverter]::GetBytes($totalPayload + 12),0, $discHeader, $DATA_SIZE_OFFSET,  8)
         [Array]::Copy([BitConverter]::GetBytes($discSampleCount),  0, $discHeader, $SAMPLE_CNT_OFFSET, 8)
         [Array]::Copy([BitConverter]::GetBytes([uint64]0),         0, $discHeader, $ID3_PTR_OFFSET,    8)
-        Write-Host "    Total payload      : $(Format-N $totalPayload) bytes ($(Format-Bytes $totalPayload))" -ForegroundColor DarkGray
-        Write-Host "    Total sample count : $(Format-N $discSampleCount) samples/ch" -ForegroundColor DarkGray
+        Write-Host "    Total payload      : " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$(Format-N $totalPayload)" -NoNewline -ForegroundColor Cyan
+        Write-Host " bytes (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$(Format-Bytes $totalPayload)" -NoNewline -ForegroundColor Cyan
+        Write-Host ")" -ForegroundColor DarkGray
+
+        Write-Host "    Total sample count : " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$(Format-N $discSampleCount)" -NoNewline -ForegroundColor Cyan
+        Write-Host " samples/ch" -ForegroundColor DarkGray
         $outStream.Position = 0
         $outStream.Write($discHeader, 0, $discHeader.Length)
     } catch {
@@ -1073,7 +1200,9 @@ for ($d = 0; $d -lt $discCount; $d++) {
         Write-Host ""; Write-Host "FATAL: Phase 1 failed (disc $($d+1)): $_" -ForegroundColor Red; exit 1
     } finally { try { $outStream.Close() } catch {} }
 
-    Write-Host "  $(Split-Path $discDsfPath -Leaf) written successfully." -ForegroundColor Green
+    Write-Host "  " -NoNewline
+    Write-Host "$(Split-Path $discDsfPath -Leaf)" -NoNewline -ForegroundColor White
+    Write-Host " written successfully." -ForegroundColor Green
     Write-Host ""
 }
 
@@ -1120,7 +1249,7 @@ for ($d = 0; $d -lt $discCount; $d++) {
 #     Skipped entirely if the disc opens immediately on audio (no silence).
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "── Phase 2: Decimation → RF64 WAV ────────────────────────────" -ForegroundColor DarkCyan
+Write-Host " ── Phase 2: Decimation → RF64 WAV ─────────────────────────" -ForegroundColor DarkCyan
 Write-Host ""
 
 $stemCount = [int]$ref.ChanCount
@@ -1132,35 +1261,72 @@ $rawRate   = $PCM_RATE
 $audioDurSec = $totalSamples / $albumSampleHz   # exact double, no rounding
 $audioTs     = Format-Ts $audioDurSec            # e.g. "95:13.467"
 
-# For parallel multi-disc runs the wall-clock time is determined by the longest
-# disc, not the total album duration — all discs run simultaneously, so the
-# bottleneck is whichever disc takes the most time to decimate.
-# Sum DSD samples per disc group from the Phase 0 trackMap, find the maximum,
-# then apply the same 2× realtime rule to that disc alone.
-if ($discCount -gt 1 -and $albumSampleHz -gt 0) {
-    $longestDiscSec = [double]0
-    for ($d = 0; $d -lt $discCount; $d++) {
-        $discSamples = [uint64]0
-        foreach ($track in $discGroups[$d]) {
-            $entry = $trackMap | Where-Object { $_.DsfPath -eq $track.FullName } | Select-Object -First 1
-            if ($entry) { $discSamples += $entry.DsfSamples }
-        }
-        $discSec = $discSamples / $albumSampleHz
-        if ($discSec -gt $longestDiscSec) { $longestDiscSec = $discSec }
-    }
-    $estProcSec = [math]::Round($longestDiscSec / 2, 0)
-    $estNote    = "$discCount discs in parallel — longest disc is the bottleneck"
-} else {
-    $estProcSec = [math]::Round($audioDurSec / 2, 0)
-    $estNote    = 'dsd2dxd ≈ 2× realtime on DSD64'
-}
-$estMin = [math]::Floor($estProcSec / 60)
-$estSec = $estProcSec % 60
+    # A smarter static heuristic for CPU time:
+    # Base assumed speed: DSD64 Stereo runs at ~6x realtime on an average CPU.
+    # Multipliers:
+    # - Channel scaling: 5.1 takes roughly 3x longer than stereo.
+    # - DSD scaling: DSD128 takes 2x longer, DSD256 takes 4x longer.
+    $baseRealtimeMult = 6.0
+    $chanScale = $stemCount / 2.0
+    $rateScale = if ($albumSampleHz -gt 0) { $albumSampleHz / 2822400.0 } else { 1.0 }
+    $cpuRealtimeMult = $baseRealtimeMult / ($chanScale * $rateScale)
 
-Write-Host "  dsd2dxd : -r $rawRate -b 24 -t E -d T -o S" -ForegroundColor DarkGray
-Write-Host "  ffmpeg  : raw PCM in → RF64 WAV ($stemCount ch, 24-bit, $(Format-N $rawRate)Hz)" -ForegroundColor DarkGray
-Write-Host "  Total audio duration : $audioTs" -ForegroundColor Gray
-Write-Host "  Estimated time       : ~${estMin}m ${estSec}s  ($estNote)" -ForegroundColor Yellow
+    # Calculate target WAV sizes for the dynamic ETA ticker
+    $discTargetWavBytes = [long[]]::new($discCount)
+    
+    if ($discCount -gt 1 -and $albumSampleHz -gt 0) {
+        $longestDiscSec = [double]0
+        for ($d = 0; $d -lt $discCount; $d++) {
+            $discSamples = [uint64]0
+            foreach ($track in $discGroups[$d]) {
+                $entry = $trackMap | Where-Object { $_.DsfPath -eq $track.FullName } | Select-Object -First 1
+                if ($entry) { $discSamples += $entry.DsfSamples }
+            }
+            $pcmSamples = [ulong][System.Numerics.BigInteger]::Divide(([bigint]$discSamples * $PCM_RATE), [bigint]$albumSampleHz)
+            $discTargetWavBytes[$d] = [long]($pcmSamples * $stemCount * 3)
+            
+            $discSec = $discSamples / $albumSampleHz
+            if ($discSec -gt $longestDiscSec) { $longestDiscSec = $discSec }
+        }
+        $estProcSec = [math]::Round($longestDiscSec / $cpuRealtimeMult, 0)
+        $speedStr = if ($cpuRealtimeMult -ge 1) { "$([math]::Round($cpuRealtimeMult, 1))× realtime" } else { "$([math]::Round(1/$cpuRealtimeMult, 1))× slower than realtime" }
+        $estNote    = "$discCount discs in parallel — longest disc determines time ($speedStr)"
+    } else {
+        if ($albumSampleHz -gt 0) {
+            $pcmSamples = [ulong][System.Numerics.BigInteger]::Divide(([bigint]$totalSamples * $PCM_RATE), [bigint]$albumSampleHz)
+            $discTargetWavBytes[0] = [long]($pcmSamples * $stemCount * 3)
+        }
+        $estProcSec = [math]::Round($audioDurSec / $cpuRealtimeMult, 0)
+        $speedStr = if ($cpuRealtimeMult -ge 1) { "$([math]::Round($cpuRealtimeMult, 1))× realtime" } else { "$([math]::Round(1/$cpuRealtimeMult, 1))× slower than realtime" }
+        $estNote    = "dsd2dxd estimated at $speedStr based on channels/rate"
+    }
+    $estMin = [math]::Floor($estProcSec / 60)
+    $estSec = $estProcSec % 60
+
+Write-Host "  Configuration:" -ForegroundColor Gray
+Write-Host "    dsd2dxd  " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "-r $rawRate -b 24 -t E -d T -o S" -ForegroundColor Cyan
+
+Write-Host "    FFmpeg   " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "raw PCM → RF64 WAV (" -NoNewline -ForegroundColor Gray
+Write-Host "$stemCount" -NoNewline -ForegroundColor Cyan
+Write-Host " ch, " -NoNewline -ForegroundColor Gray
+Write-Host "24-bit" -NoNewline -ForegroundColor Cyan
+Write-Host ", " -NoNewline -ForegroundColor Gray
+Write-Host "$(Format-N $rawRate)" -NoNewline -ForegroundColor Cyan
+Write-Host "Hz)" -ForegroundColor Gray
+
+Write-Host "  Pipeline Status:" -ForegroundColor Gray
+Write-Host "    Duration " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host $audioTs -ForegroundColor Cyan
+
+Write-Host "    Estimate " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "~${estMin}m ${estSec}s" -NoNewline -ForegroundColor Yellow
+Write-Host "  ($estNote)" -ForegroundColor DarkGray
 Write-Host ""
 
 # $discWavPaths[d] = the per-disc intermediate RF64 file.
@@ -1464,38 +1630,47 @@ $timer = [System.Diagnostics.Stopwatch]::StartNew()
 # Single-disc : same \r refreshing ticker — ffmpeg -nostats keeps the line clean.
 # ─────────────────────────────────────────────────────────────────────────────
 if ($discCount -eq 1) {
-    # Single-disc: watch the one output WAV grow, same style as 2-4 disc \r ticker.
     $wavPath = $discWavPaths[0]
+    $targetBytes = $discTargetWavBytes[0]
     while ($job.State -eq 'Running' -or $job.State -eq 'NotStarted') {
         $ts      = $timer.Elapsed
         $timeStr = "{0}:{1:D2}" -f [int]$ts.TotalMinutes, $ts.Seconds
+        $etaStr  = "..."
         if (Test-Path -LiteralPath $wavPath) {
             $sz    = (Get-Item -LiteralPath $wavPath).Length
-            $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" }
-                     else             { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+            $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+            if ($targetBytes -gt 0) {
+                $pct = [math]::Clamp([math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                $szStr = "$szStr ($pct%)"
+                if ($pct -lt 100 -and $ts.TotalSeconds -gt 5) {
+                    $speed = $sz / $ts.TotalSeconds
+                    if ($speed -gt 0) {
+                        $etaSec = ($targetBytes - $sz) / $speed
+                        $etaStr = "{0}m {1}s" -f [math]::Floor($etaSec / 60), [math]::Round($etaSec % 60)
+                    }
+                } elseif ($pct -ge 100) { $etaStr = "Done" }
+            }
         } else { $szStr = '  ---  ' }
-        $line = "  Decimating Album [Elapsed: $timeStr] [WAV: $($szStr.PadLeft(10))]"
-        [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 80)))
+        $line = "  Decimating Album [Elapsed: $timeStr | ETA: $etaStr] [WAV: $($szStr.PadLeft(14))]"
+        [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 120)))
         Start-Sleep -Milliseconds 500
     }
-    # Final snapshot — replace the live line with the finished summary.
+    # Final snapshot
     $ts      = $timer.Elapsed
     $timeStr = "{0}:{1:D2}" -f [int]$ts.TotalMinutes, $ts.Seconds
     if (Test-Path -LiteralPath $wavPath) {
         $sz    = (Get-Item -LiteralPath $wavPath).Length
-        $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" }
-                 else             { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+        $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+        if ($targetBytes -gt 0) { $szStr = "$szStr (100%)" }
     } else { $szStr = 'missing' }
-    $line = "  Decimating Album [Elapsed: $timeStr] [WAV: $($szStr.PadLeft(10))]"
-    [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 80)))
-    Write-Host ""   # newline to close the \r line
+    $line = "  Decimating Album [Elapsed: $timeStr | ETA: Done] [WAV: $($szStr.PadLeft(14))]"
+    [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 120)))
+    Write-Host ""
 } else {
     $useMultiLine = ($discCount -ge 5)
     $tickerStartRow = -1
 
     if ($useMultiLine) {
-        # Reserve $discCount + 1 lines (one per disc, one for the elapsed footer).
-        # Record the cursor row BEFORE printing placeholders so we can seek back.
         for ($d = 0; $d -lt $discCount; $d++) {
             Write-Host "  D$($d+1): initialising..." -ForegroundColor DarkGray
         }
@@ -1506,63 +1681,133 @@ if ($discCount -eq 1) {
     while ($job.State -eq 'Running' -or $job.State -eq 'NotStarted') {
         $ts      = $timer.Elapsed
         $timeStr = "{0}:{1:D2}" -f [int]$ts.TotalMinutes, $ts.Seconds
+        $maxEtaSec = [double]0
+        $allMissing = $true
+        $allDone = $true
 
         if ($useMultiLine) {
-            # Overwrite each reserved row in-place — no scrolling, no wrap.
             for ($d = 0; $d -lt $discCount; $d++) {
                 $w = $discWavPaths[$d]
+                $targetBytes = $discTargetWavBytes[$d]
                 if (Test-Path -LiteralPath $w) {
+                    $allMissing = $false
                     $sz    = (Get-Item -LiteralPath $w).Length
                     $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
                     $szStr = $szStr.PadLeft(10)
-                } else { $szStr = '  ---  '.PadLeft(10) }
+                    
+                    if ($targetBytes -gt 0) {
+                        $pct = [math]::Clamp([math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                        $szStr = "$szStr ($pct%)"
+                        if ($pct -lt 100) {
+                            $allDone = $false
+                            if ($ts.TotalSeconds -gt 5) {
+                                $speed = $sz / $ts.TotalSeconds
+                                if ($speed -gt 0) {
+                                    $eta = ($targetBytes - $sz) / $speed
+                                    if ($eta -gt $maxEtaSec) { $maxEtaSec = $eta }
+                                }
+                            }
+                        }
+                    } else {
+                        $allDone = $false
+                    }
+                } else { 
+                    $szStr = '  ---  '.PadLeft(10) 
+                    $allDone = $false
+                }
                 [Console]::SetCursorPosition(0, $tickerStartRow + $d)
                 $row = "  D$($d+1): $szStr"
                 [Console]::Write($row.PadRight(48))
             }
-            # Elapsed footer on the row immediately below the disc list.
+            
+            $etaStr = "..."
+            if ($allDone) { $etaStr = "Done" }
+            elseif (-not $allMissing -and $ts.TotalSeconds -gt 5) {
+                $etaStr = "{0}m {1}s" -f [math]::Floor($maxEtaSec / 60), [math]::Round($maxEtaSec % 60)
+            }
+            
             [Console]::SetCursorPosition(0, $tickerStartRow + $discCount)
-            [Console]::Write(("  Elapsed: $timeStr").PadRight(48))
-            # Park the cursor below the block so any unexpected output doesn't
-            # overwrite our display area.
+            [Console]::Write(("  Elapsed: $timeStr  |  ETA: $etaStr").PadRight(48))
             [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
         } else {
-            # Single refreshing line — safe for 2-4 discs at 80+ columns.
             $parts = for ($d = 0; $d -lt $discCount; $d++) {
                 $w = $discWavPaths[$d]
+                $targetBytes = $discTargetWavBytes[$d]
                 if (Test-Path -LiteralPath $w) {
+                    $allMissing = $false
                     $sz    = (Get-Item -LiteralPath $w).Length
-                    $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" }
-                             else             { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
-                    "D$($d+1): $($szStr.PadLeft(10))"
-                } else { "D$($d+1):    ---    " }
+                    $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+                    if ($targetBytes -gt 0) {
+                        $pct = [math]::Clamp([math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                        if ($pct -lt 100) {
+                            $allDone = $false
+                            if ($ts.TotalSeconds -gt 5) {
+                                $speed = $sz / $ts.TotalSeconds
+                                if ($speed -gt 0) {
+                                    $eta = ($targetBytes - $sz) / $speed
+                                    if ($eta -gt $maxEtaSec) { $maxEtaSec = $eta }
+                                }
+                            }
+                        }
+                        "D$($d+1): $($szStr.PadLeft(10)) (${pct}%)"
+                    } else {
+                        $allDone = $false
+                        "D$($d+1): $($szStr.PadLeft(10))"
+                    }
+                } else { 
+                    $allDone = $false
+                    "D$($d+1):    ---    " 
+                }
             }
-            $line = "  Decimating $discCount Discs in Parallel [Elapsed: $timeStr] [$($parts -join '  |  ')]"
-            [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 80)))
+            
+            $etaStr = "..."
+            if ($allDone) { $etaStr = "Done" }
+            elseif (-not $allMissing -and $ts.TotalSeconds -gt 5) {
+                $etaStr = "{0}m {1}s" -f [math]::Floor($maxEtaSec / 60), [math]::Round($maxEtaSec % 60)
+            }
+            
+            $line = "  Decimating $discCount Discs in Parallel [Elapsed: $timeStr | ETA: $etaStr] [$($parts -join ' | ')]"
+            [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 120)))
         }
         Start-Sleep -Milliseconds 500
     }
 
     # Finalise display.
     if ($useMultiLine) {
-        # Move cursor below the display block so subsequent Write-Host lines flow normally.
-        [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
-    } else {
-        # Terminate the \r line cleanly — print a final summary, then newline.
-        $parts = for ($d = 0; $d -lt $discCount; $d++) {
+        $ts      = $timer.Elapsed
+        $timeStr = "{0}:{1:D2}" -f [int]$ts.TotalMinutes, $ts.Seconds
+        for ($d = 0; $d -lt $discCount; $d++) {
             $w = $discWavPaths[$d]
+            $targetBytes = $discTargetWavBytes[$d]
             if (Test-Path -LiteralPath $w) {
                 $sz    = (Get-Item -LiteralPath $w).Length
-                $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" }
-                         else             { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+                $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+                $szStr = $szStr.PadLeft(10)
+                if ($targetBytes -gt 0) { $szStr = "$szStr (100%)" }
+            } else { $szStr = 'missing'.PadLeft(10) }
+            [Console]::SetCursorPosition(0, $tickerStartRow + $d)
+            $row = "  D$($d+1): $szStr"
+            [Console]::Write($row.PadRight(48))
+        }
+        [Console]::SetCursorPosition(0, $tickerStartRow + $discCount)
+        [Console]::Write(("  Elapsed: $timeStr  |  ETA: Done").PadRight(48))
+        [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
+    } else {
+        $parts = for ($d = 0; $d -lt $discCount; $d++) {
+            $w = $discWavPaths[$d]
+            $targetBytes = $discTargetWavBytes[$d]
+            if (Test-Path -LiteralPath $w) {
+                $sz    = (Get-Item -LiteralPath $w).Length
+                $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
+                if ($targetBytes -gt 0) { $szStr = "$szStr (100%)" }
                 "D$($d+1): $($szStr.PadLeft(10))"
             } else { "D$($d+1):    missing   " }
         }
         $ts      = $timer.Elapsed
         $timeStr = "{0}:{1:D2}" -f [int]$ts.TotalMinutes, $ts.Seconds
-        $line = "  Decimating $discCount Discs in Parallel [Elapsed: $timeStr] [$($parts -join '  |  ')]"
-        [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 80)))
-        Write-Host ""   # newline to close the \r line
+        $line = "  Decimating $discCount Discs in Parallel [Elapsed: $timeStr | ETA: Done] [$($parts -join ' | ')]"
+        [Console]::Write("`r" + $line.PadRight([Math]::Max($line.Length, 120)))
+        Write-Host ""
     }
 }
 
@@ -1617,16 +1862,24 @@ if ($discCount -gt 1) {
     }
     Remove-Item -LiteralPath $concatListPath -Force -ErrorAction SilentlyContinue
     $wavSize = (Get-Item $monolithWav).Length
-    Write-Host "  Album_Monolithic.wav written ($(Format-Bytes $wavSize))." -ForegroundColor Green
+    Write-Host "  " -NoNewline
+    Write-Host "Album_Monolithic.wav" -NoNewline -ForegroundColor White
+    Write-Host " written (" -NoNewline -ForegroundColor Gray
+    Write-Host "$(Format-Bytes $wavSize)" -NoNewline -ForegroundColor Cyan
+    Write-Host ")." -ForegroundColor Gray
     Write-Host ""
 
     # Per-disc DSF and WAV intermediates are retained alongside Album_Monolithic.wav.
-    Write-Host "  Per-disc intermediates retained:" -ForegroundColor DarkGray
+    Write-Host "  Per-disc intermediates retained:" -ForegroundColor Gray
     for ($d = 0; $d -lt $discCount; $d++) {
         foreach ($p in @($discDsfPaths[$d], $discWavPaths[$d])) {
             if (Test-Path $p) {
                 $sz = (Get-Item $p).Length
-                Write-Host "    $(Split-Path $p -Leaf) ($(Format-Bytes $sz))" -ForegroundColor DarkGray
+                Write-Host "    " -NoNewline
+                Write-Host "$(Split-Path $p -Leaf)" -NoNewline -ForegroundColor White
+                Write-Host " (" -NoNewline -ForegroundColor DarkGray
+                Write-Host "$(Format-Bytes $sz)" -NoNewline -ForegroundColor Cyan
+                Write-Host ")" -ForegroundColor DarkGray
             }
         }
     }
@@ -1659,7 +1912,7 @@ if ($discCount -gt 1) {
 # samples in a 32-bit container, avoiding any accidental truncation.
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "── Phase 3: Parallel FLAC Slicing ──────────────────────────" -ForegroundColor DarkCyan
+Write-Host " ── Phase 3: Parallel FLAC Slicing ─────────────────────────" -ForegroundColor DarkCyan
 Write-Host ""
 
 if ($runFlac) {
@@ -1671,9 +1924,27 @@ if ($trackMap.Count -eq 0) {
     exit 1
 }
 
-Write-Host "  Slicing $($trackMap.Count) tracks in parallel ($FLAC_THROTTLE threads — I/O throttled)" -ForegroundColor White
-Write-Host "  Method : atrim start_sample / end_sample — integer-exact, zero drift" -ForegroundColor DarkGray
-Write-Host "  Codec  : FLAC, compression level $FLAC_LEVEL, 24-bit" -ForegroundColor DarkGray
+Write-Host "  Configuration:" -ForegroundColor Gray
+Write-Host "    Engine   " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "Parallel Slicing (" -NoNewline -ForegroundColor Gray
+Write-Host "$($trackMap.Count)" -NoNewline -ForegroundColor Cyan
+Write-Host " tracks, " -NoNewline -ForegroundColor Gray
+Write-Host "$FLAC_THROTTLE" -NoNewline -ForegroundColor Cyan
+Write-Host " threads, I/O-optimized)" -ForegroundColor Gray
+
+Write-Host "    Method   " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "atrim start_sample / end_sample " -NoNewline -ForegroundColor Cyan
+Write-Host "— integer-exact, zero drift" -ForegroundColor DarkGray
+
+Write-Host "    Codec    " -NoNewline -ForegroundColor White
+Write-Host ": " -NoNewline -ForegroundColor DarkGray
+Write-Host "FLAC" -NoNewline -ForegroundColor Cyan
+Write-Host " (lossless), compression level " -NoNewline -ForegroundColor Gray
+Write-Host "$FLAC_LEVEL" -NoNewline -ForegroundColor Cyan
+Write-Host ", " -NoNewline -ForegroundColor Gray
+Write-Host "24-bit" -ForegroundColor Cyan
 Write-Host ""
 
 $shared    = [hashtable]::Synchronized(@{ Completed = 0; Failed = 0 })
@@ -1814,15 +2085,33 @@ $trackMap | ForEach-Object -Parallel {
             if ($null -eq $outItem -or $outItem.Length -eq 0) {
                 $encodeSuccess = $false
                 $shared.Failed++
-                Write-Host "  [FAIL] [$n/$total] $($entry.Name) — FFmpeg exited 0 but output file is missing or empty." -ForegroundColor Red
+                Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+                Write-Host "FAIL" -NoNewline -ForegroundColor Red
+                Write-Host "] [" -NoNewline -ForegroundColor DarkGray
+                Write-Host "$n/$total" -NoNewline -ForegroundColor Cyan
+                Write-Host "] " -NoNewline -ForegroundColor DarkGray
+                Write-Host "$($entry.Name) — FFmpeg exited 0 but output file is missing or empty." -ForegroundColor Red
             } else {
                 $sz       = $outItem.Length
                 $fileName = [System.IO.Path]::GetFileName($outFlac)
-                Write-Host "  [ OK ] [$n/$total] $fileName ($(Format-Bytes $sz))" -ForegroundColor Green
+                Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+                Write-Host " OK " -NoNewline -ForegroundColor Green
+                Write-Host "] [" -NoNewline -ForegroundColor DarkGray
+                Write-Host "$n/$total" -NoNewline -ForegroundColor Cyan
+                Write-Host "] " -NoNewline -ForegroundColor DarkGray
+                Write-Host $fileName -NoNewline -ForegroundColor White
+                Write-Host " (" -NoNewline -ForegroundColor DarkGray
+                Write-Host "$(Format-Bytes $sz)" -NoNewline -ForegroundColor Cyan
+                Write-Host ")" -ForegroundColor DarkGray
             }
         } else {
             $shared.Failed++
-            Write-Host "  [FAIL] [$n/$total] $($entry.Name)" -ForegroundColor Red
+            Write-Host "  [" -NoNewline -ForegroundColor DarkGray
+            Write-Host "FAIL" -NoNewline -ForegroundColor Red
+            Write-Host "] [" -NoNewline -ForegroundColor DarkGray
+            Write-Host "$n/$total" -NoNewline -ForegroundColor Cyan
+            Write-Host "] " -NoNewline -ForegroundColor DarkGray
+            Write-Host $entry.Name -ForegroundColor Red
             if ($encodeOutput) { $encodeOutput | ForEach-Object { Write-Host "    >> $_" -ForegroundColor DarkRed } }
         }
     } finally { $logMutex.ReleaseMutex() }
@@ -1835,7 +2124,9 @@ Write-Host ""
     if ($shared.Failed -gt 0) {
         Write-Host "WARNING: $($shared.Failed) FLAC(s) failed to encode. Review output above." -ForegroundColor Yellow
     } else {
-        Write-Host "  All $total FLACs written successfully." -ForegroundColor Green
+        Write-Host "  All " -NoNewline -ForegroundColor Gray
+        Write-Host $total -NoNewline -ForegroundColor Cyan
+        Write-Host " FLACs written successfully." -ForegroundColor Green
     }
     Write-Host ""
 } else {
@@ -1853,14 +2144,20 @@ Write-Host ""
 # ══════════════════════════════════════════════════════════════════════════════
 
 if ($runTrueHD) {
-    Write-Host "── Phase 4: TrueHD Stem Routing ────────────────────────────" -ForegroundColor DarkCyan
+    Write-Host " ── Phase 4: TrueHD Stem Routing ───────────────────────────" -ForegroundColor DarkCyan
     Write-Host ""
 
-    $chanNames = switch ($stemCount) {
-        1  { @('C') }
-        2  { @('L','R') }
-        6  { @('L','R','C','LFE','Ls','Rs') }
-        8  { @('L','R','C','LFE','Lb','Rb','Ls','Rs') }
+    # Switch on the authoritative Scarlet Book channel type rather than the raw stem count.
+    # This guarantees accurate stem naming for ambiguous counts (e.g. 4ch = Quad OR 3.1).
+    $chanNames = switch ($channelType) {
+        1 { @('C') }                                   # Mono
+        2 { @('L','R') }                               # Stereo
+        3 { @('L','R','C') }                           # 3.0
+        4 { @('L','R','Ls','Rs') }                     # Quad
+        5 { @('L','R','C','LFE') }                     # 3.1
+        6 { @('L','R','C','Ls','Rs') }                 # 5.0
+        7 { @('L','R','C','LFE','Ls','Rs') }           # 5.1
+        9 { @('L','R','C','LFE','Lb','Rb','Ls','Rs') } # 7.1
         # 'CHAN{0:D2}' requires PowerShell's -f operator to expand the placeholder.
         # Without it, every stem would be written as 'CHAN{0:D2}.wav' literally.
         default { 0..($stemCount-1) | ForEach-Object { 'CHAN{0:D2}' -f $_ } }
@@ -1893,16 +2190,55 @@ if ($runTrueHD) {
         exit 1
     }
 
-    Write-Host "  Stems written:" -ForegroundColor Green
+    Write-Host "  Stems written:" -ForegroundColor Gray
     foreach ($name in $chanNames) {
         $f = Join-Path $scriptDir "Album_$name.wav"
         if (Test-Path $f) {
             $sz = (Get-Item $f).Length
-            Write-Host "    [OK] Album_$name.wav ($(Format-Bytes $sz))" -ForegroundColor Cyan
+            Write-Host "    [" -NoNewline -ForegroundColor DarkGray
+            Write-Host "OK" -NoNewline -ForegroundColor Green
+            Write-Host "] " -NoNewline -ForegroundColor DarkGray
+            Write-Host "Album_$name.wav" -NoNewline -ForegroundColor White
+            Write-Host " (" -NoNewline -ForegroundColor DarkGray
+            Write-Host "$(Format-Bytes $sz)" -NoNewline -ForegroundColor Cyan
+            Write-Host ")" -ForegroundColor DarkGray
         } else {
-            Write-Host "    [MISSING] Album_$name.wav" -ForegroundColor Red
+            Write-Host "    [" -NoNewline -ForegroundColor DarkGray
+            Write-Host "MISSING" -NoNewline -ForegroundColor Red
+            Write-Host "] " -NoNewline -ForegroundColor DarkGray
+            Write-Host "Album_$name.wav" -ForegroundColor Red
         }
     }
+    Write-Host ""
+
+    # ── Generate MKVToolNix Chapters ──────────────────────────────────────────
+    Write-Host "  Generating MKVToolNix-compatible chapters..." -ForegroundColor Yellow
+    $chaptersFile = Join-Path $scriptDir "Album_Chapters.txt"
+    $chapterLines = [System.Collections.Generic.List[string]]::new()
+
+    $chapterIndex = 1
+    foreach ($entry in $trackMap) {
+        $tsSec     = $entry.PcmStart / $PCM_RATE
+        $timestamp = Format-ChapterTs $tsSec
+        $rawTitle  = Get-ChapterTitle $entry.Name
+        
+        # MKVToolNix Simple OGM Chapter Format strictly requires this two-line structure
+        $chapterLines.Add("CHAPTER$($chapterIndex.ToString('D2'))=$timestamp")
+        $chapterLines.Add("CHAPTER$($chapterIndex.ToString('D2'))NAME=$rawTitle")
+        $chapterIndex++
+    }
+
+    # Write as UTF-8 without BOM (standard for MKVToolNix and cross-platform compatibility)
+    [System.IO.File]::WriteAllLines($chaptersFile, $chapterLines, [System.Text.UTF8Encoding]::new($false))
+    
+    $chaptersSize = (Get-Item $chaptersFile).Length
+    Write-Host "    [" -NoNewline -ForegroundColor DarkGray
+    Write-Host "OK" -NoNewline -ForegroundColor Green
+    Write-Host "] " -NoNewline -ForegroundColor DarkGray
+    Write-Host "Album_Chapters.txt written" -NoNewline -ForegroundColor White
+    Write-Host " (" -NoNewline -ForegroundColor DarkGray
+    Write-Host "$(Format-Bytes $chaptersSize)" -NoNewline -ForegroundColor Cyan
+    Write-Host ")" -ForegroundColor DarkGray
     Write-Host ""
 }
 
@@ -1913,16 +2249,20 @@ if ($runTrueHD) {
 # This phase simply reports what is on disk for the user to inspect.
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "── Phase 5: Output Inventory ───────────────────────────────" -ForegroundColor DarkCyan
+Write-Host " ── Phase 5: Output Inventory ──────────────────────────────" -ForegroundColor DarkCyan
 Write-Host ""
 
 # Report all monolithic files retained from this run.
 $monolithFiles = Get-ChildItem -Path $scriptDir -Filter '*_Monolithic.*' | Sort-Object Name
 if ($monolithFiles) {
-    Write-Host "  Monolithic files retained:" -ForegroundColor DarkGray
+    Write-Host "  Monolithic files retained:" -ForegroundColor Gray
     foreach ($f in $monolithFiles) {
         $sz = $f.Length
-        Write-Host "    $($f.Name) ($(Format-Bytes $sz))" -ForegroundColor DarkGray
+        Write-Host "    " -NoNewline
+        Write-Host "$($f.Name)" -NoNewline -ForegroundColor White
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$(Format-Bytes $sz)" -NoNewline -ForegroundColor Cyan
+        Write-Host ")" -ForegroundColor DarkGray
     }
     Write-Host ""
 }
@@ -1933,19 +2273,25 @@ Write-Host ""
 # COMPLETION SUMMARY
 # ══════════════════════════════════════════════════════════════════════════════
 
-Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host " ════════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
 Write-Host "  Complete." -ForegroundColor Green
 Write-Host ""
 if ($runFlac) {
-    Write-Host "  $total × gapless 24-bit/96kHz FLAC tracks written." -ForegroundColor Gray
+    Write-Host "  " -NoNewline
+    Write-Host $total -NoNewline -ForegroundColor Cyan
+    Write-Host " × gapless 24-bit/96kHz FLAC tracks written." -ForegroundColor Gray
 }
 if ($runTrueHD) {
-    Write-Host "  $stemCount × discrete mono $STEM_CODEC WAV stems written for TrueHD mux." -ForegroundColor Gray
+    Write-Host "  " -NoNewline
+    Write-Host $stemCount -NoNewline -ForegroundColor Cyan
+    Write-Host " × discrete mono " -NoNewline -ForegroundColor Gray
+    Write-Host $STEM_CODEC -NoNewline -ForegroundColor White
+    Write-Host " WAV stems written for TrueHD mux." -ForegroundColor Gray
 }
 Write-Host ""
 if ($runFlac) {
     Write-Host "  FLAC files peak at the original Scarlet Book level (~-6 to -3 dBFS)." -ForegroundColor DarkGray
     Write-Host "  Run a ReplayGain album scan if consistent playback loudness is required." -ForegroundColor DarkGray
 }
-Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host " ════════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
 Write-Host ""
