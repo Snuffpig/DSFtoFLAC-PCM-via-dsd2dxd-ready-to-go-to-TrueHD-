@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
-    Version: v1.0.1
+    Version: v1.0.2
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -136,7 +136,7 @@ Write-Host "║" -ForegroundColor DarkCyan
 Write-Host " ╟──────────────────────────────────────────────────────────╢" -ForegroundColor DarkCyan
 Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
 Write-Host "  Engine: " -NoNewline -ForegroundColor DarkGray
-Write-Host "dsd2dxd v1.0.1" -NoNewline -ForegroundColor White
+Write-Host "dsd2dxd v1.0.2" -NoNewline -ForegroundColor White
 Write-Host "                " -NoNewline
 Write-Host "Parallel: " -NoNewline -ForegroundColor DarkGray
 Write-Host "Active" -NoNewline -ForegroundColor Green
@@ -1640,7 +1640,7 @@ if ($discCount -eq 1) {
             $sz    = (Get-Item -LiteralPath $wavPath).Length
             $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
             if ($targetBytes -gt 0) {
-                $pct = [math]::Clamp([math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                $pct = [math]::Clamp([int][math]::Round(($sz / $targetBytes) * 100), 0, 100)
                 $szStr = "$szStr ($pct%)"
                 if ($pct -lt 100 -and $ts.TotalSeconds -gt 5) {
                     $speed = $sz / $ts.TotalSeconds
@@ -1696,7 +1696,7 @@ if ($discCount -eq 1) {
                     $szStr = $szStr.PadLeft(10)
                     
                     if ($targetBytes -gt 0) {
-                        $pct = [math]::Clamp([math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                        $pct = [math]::Clamp([int][math]::Round(($sz / $targetBytes) * 100), 0, 100)
                         $szStr = "$szStr ($pct%)"
                         if ($pct -lt 100) {
                             $allDone = $false
@@ -1738,7 +1738,7 @@ if ($discCount -eq 1) {
                     $sz    = (Get-Item -LiteralPath $w).Length
                     $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
                     if ($targetBytes -gt 0) {
-                        $pct = [math]::Clamp([math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                        $pct = [math]::Clamp([int][math]::Round(($sz / $targetBytes) * 100), 0, 100)
                         if ($pct -lt 100) {
                             $allDone = $false
                             if ($ts.TotalSeconds -gt 5) {
