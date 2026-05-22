@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
-    Version: v1.0.2
+    Version: v1.0.3
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -121,7 +121,7 @@ $FLAC_THROTTLE  = [math]::Min(4, [Environment]::ProcessorCount)
 # ══════════════════════════════════════════════════════════════════════════════
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
-if ($scriptDir) { Set-Location $scriptDir }
+if ($scriptDir) { Set-Location -LiteralPath $scriptDir }
 
 Write-Host ""
 Write-Host " ╔══════════════════════════════════════════════════════════╗" -ForegroundColor DarkCyan
@@ -682,6 +682,32 @@ Write-Host ""
 
 Write-Host " ════════════════════════════════════════════════════════════" -ForegroundColor DarkCyan
 if ($globalFail) {
+    # Heuristic mixed-format analysis to provide premium user advice
+    $uniqueChanCounts = $consistency | Select-Object -ExpandProperty ChanCount -Unique
+    if ($uniqueChanCounts.Count -gt 1) {
+        Write-Host ""
+        Write-Host "  ⚠  MIXED CHANNEL CONFIGURATION DETECTED" -ForegroundColor Yellow
+        Write-Host "     This album contains a mix of channel counts: $($uniqueChanCounts -join ', ') channels." -ForegroundColor Yellow
+        Write-Host "     The gapless pipeline requires all tracks to have identical channel layouts." -ForegroundColor DarkGray
+        Write-Host "     ADVICE: Please separate the stereo (2ch) and multichannel (e.g., 5.1) tracks" -ForegroundColor Gray
+        Write-Host "             into separate folders and run this pipeline on them individually." -ForegroundColor Gray
+    }
+
+    $uniqueSampleFreqs = $consistency | Select-Object -ExpandProperty SampleFreq -Unique
+    if ($uniqueSampleFreqs.Count -gt 1) {
+        Write-Host ""
+        Write-Host "  ⚠  MIXED SAMPLING FREQUENCY DETECTED" -ForegroundColor Yellow
+        $freqStrs = $uniqueSampleFreqs | ForEach-Object {
+            $freqLabel  = switch ($_) { 2822400{'DSD64'} 5644800{'DSD128'} 11289600{'DSD256'} default{'unknown'} }
+            "$(Format-N $_) Hz ($freqLabel)"
+        }
+        Write-Host "     This album contains a mix of sample rates: $($freqStrs -join ' vs ')." -ForegroundColor Yellow
+        Write-Host "     The monolithic processing filter requires all tracks to have an identical sampling rate." -ForegroundColor DarkGray
+        Write-Host "     ADVICE: Please separate tracks with different sample rates into separate folders" -ForegroundColor Gray
+        Write-Host "             and run this pipeline on them individually." -ForegroundColor Gray
+    }
+
+    Write-Host ""
     Write-Host "  VERDICT: FAIL — Aborting." -ForegroundColor Red
     Write-Host "  Resolve the FAIL items above before proceeding." -ForegroundColor Red
     exit 1
@@ -1390,7 +1416,7 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
         throw $_
     }
 
-    $dstSize = (Get-Item $discWavPath -ErrorAction SilentlyContinue).Length
+    $dstSize = (Get-Item -LiteralPath $discWavPath -ErrorAction SilentlyContinue).Length
     if ($null -eq $dstSize -or $dstSize -eq 0) {
         Remove-Item -LiteralPath $discWavPath -ErrorAction SilentlyContinue
         Write-Host ""
@@ -1841,7 +1867,7 @@ if ($discCount -gt 1) {
     $discWavPaths | ForEach-Object {
         $fwd = $_.Replace('\', '/').Replace("'", "'\''")  
         "file '$fwd'"
-    } | Set-Content $concatListPath -Encoding UTF8
+    } | Set-Content -LiteralPath $concatListPath -Encoding UTF8
 
     # -c copy: no re-encoding — ffmpeg reads each RF64's PCM data chunk and
     # writes it to the output, updating the RF64 header with the total size.
@@ -1861,7 +1887,7 @@ if ($discCount -gt 1) {
         exit 1
     }
     Remove-Item -LiteralPath $concatListPath -Force -ErrorAction SilentlyContinue
-    $wavSize = (Get-Item $monolithWav).Length
+    $wavSize = (Get-Item -LiteralPath $monolithWav).Length
     Write-Host "  " -NoNewline
     Write-Host "Album_Monolithic.wav" -NoNewline -ForegroundColor White
     Write-Host " written (" -NoNewline -ForegroundColor Gray
@@ -1873,8 +1899,8 @@ if ($discCount -gt 1) {
     Write-Host "  Per-disc intermediates retained:" -ForegroundColor Gray
     for ($d = 0; $d -lt $discCount; $d++) {
         foreach ($p in @($discDsfPaths[$d], $discWavPaths[$d])) {
-            if (Test-Path $p) {
-                $sz = (Get-Item $p).Length
+            if (Test-Path -LiteralPath $p) {
+                $sz = (Get-Item -LiteralPath $p).Length
                 Write-Host "    " -NoNewline
                 Write-Host "$(Split-Path $p -Leaf)" -NoNewline -ForegroundColor White
                 Write-Host " (" -NoNewline -ForegroundColor DarkGray
@@ -2081,7 +2107,7 @@ $trackMap | ForEach-Object -Parallel {
             # Get-Item throws ItemNotFoundException for missing files; use
             # -ErrorAction SilentlyContinue so a vanished file is caught cleanly
             # and reclassified as a failure rather than crashing the runspace.
-            $outItem = Get-Item $outFlac -ErrorAction SilentlyContinue
+            $outItem = Get-Item -LiteralPath $outFlac -ErrorAction SilentlyContinue
             if ($null -eq $outItem -or $outItem.Length -eq 0) {
                 $encodeSuccess = $false
                 $shared.Failed++
@@ -2193,8 +2219,8 @@ if ($runTrueHD) {
     Write-Host "  Stems written:" -ForegroundColor Gray
     foreach ($name in $chanNames) {
         $f = Join-Path $scriptDir "Album_$name.wav"
-        if (Test-Path $f) {
-            $sz = (Get-Item $f).Length
+        if (Test-Path -LiteralPath $f) {
+            $sz = (Get-Item -LiteralPath $f).Length
             Write-Host "    [" -NoNewline -ForegroundColor DarkGray
             Write-Host "OK" -NoNewline -ForegroundColor Green
             Write-Host "] " -NoNewline -ForegroundColor DarkGray
@@ -2231,7 +2257,7 @@ if ($runTrueHD) {
     # Write as UTF-8 without BOM (standard for MKVToolNix and cross-platform compatibility)
     [System.IO.File]::WriteAllLines($chaptersFile, $chapterLines, [System.Text.UTF8Encoding]::new($false))
     
-    $chaptersSize = (Get-Item $chaptersFile).Length
+    $chaptersSize = (Get-Item -LiteralPath $chaptersFile).Length
     Write-Host "    [" -NoNewline -ForegroundColor DarkGray
     Write-Host "OK" -NoNewline -ForegroundColor Green
     Write-Host "] " -NoNewline -ForegroundColor DarkGray
@@ -2253,7 +2279,7 @@ Write-Host " ── Phase 5: Output Inventory ───────────�
 Write-Host ""
 
 # Report all monolithic files retained from this run.
-$monolithFiles = Get-ChildItem -Path $scriptDir -Filter '*_Monolithic.*' | Sort-Object Name
+$monolithFiles = Get-ChildItem -LiteralPath $scriptDir -Filter '*_Monolithic.*' | Sort-Object Name
 if ($monolithFiles) {
     Write-Host "  Monolithic files retained:" -ForegroundColor Gray
     foreach ($f in $monolithFiles) {
