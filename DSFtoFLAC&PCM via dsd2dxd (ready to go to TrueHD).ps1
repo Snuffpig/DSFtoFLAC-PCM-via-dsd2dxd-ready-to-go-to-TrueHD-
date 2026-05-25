@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
-    Version: v1.0.4
+    Version: v1.0.5
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -2406,18 +2406,27 @@ if ($runTrueHD) {
 
     # 2. If seed video was generated successfully, infinitely loop-copy it using the stream copy demuxer.
     # This runs at pure disk I/O speeds (instantaneous) and maps the FFMETADATA1 chapters.
+    # Disables global/stream metadata tags while preserving chapters, and sets the video stream disposition as default.
     if ($seedSuccess -and (Test-Path -LiteralPath $tempBlack)) {
         $ffLoopArgs = @(
             '-hide_banner','-v','error','-y',
             '-stream_loop','-1',
             '-i',$tempBlack,
             '-i',$metaFile,
-            '-map_metadata','1',
+            '-map_metadata','-1',
+            '-map_metadata:s','-1',
+            '-map_chapters','1',
             '-frames:v',[string]$videoFrames,
             '-c:v','copy',
+            '-disposition:v:0','default',
             $videoFile
         )
         $videoOut = & ffmpeg @ffLoopArgs 2>&1
+        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $videoFile)) {
+            if (Get-Command mkvpropedit -ErrorAction SilentlyContinue) {
+                & mkvpropedit $videoFile --tags all: 2>&1 | Out-Null
+            }
+        }
     } else {
         $LASTEXITCODE = 1
     }
