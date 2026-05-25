@@ -24,6 +24,7 @@ This pipeline eradicates these issues by treating the disc as a single, unbroken
     * These fades are applied at a scale significantly below the human psychoacoustic masking threshold, making them mathematically effective yet entirely inaudible.
 * **Sample-Accurate Slicing**: The pipeline parses DSF SampleCount headers at offset 0x40 to construct an integer-exact PCM boundary map. Slicing is performed via FFmpeg’s atrim filter, ensuring zero drift and perfect gapless playback.
 * **RF64 Intermediates**: Utilises the EBU 64-bit WAV extension to bypass the 4GB RIFF limitation, essential for high-resolution multi-channel archives.
+* **Mathematically Perfect 25 fps Video**: Operates at **25 fps** to achieve a frame duration of exactly **40 milliseconds** ($1000 / 25 = 40\text{ ms}$). This snaps perfectly to Matroska’s native integer millisecond grid, eliminating all timeline drift over long playback durations. It encodes a tiny 1-second seed video and loop-copies it instantly (`-c:v copy`), compiling in under a second and producing an incredibly compact **~15–20 MiB** black video track.
 
 ---
 
@@ -31,7 +32,8 @@ This pipeline eradicates these issues by treating the disc as a single, unbroken
 
 * **Filter Topology**: Equiripple (minimax) FIR decimation via dsd2dxd.
 * **Output Formats**: Gapless 24-bit/96kHz FLAC (Compression Level 8).
-* **Home Cinema**: Optional routing to discrete mono pcm_s24le WAV stems for TrueHD muxing.
+* **Home Cinema Stems**: Optional routing to discrete mono pcm_s24le WAV stems.
+* **Dolby TrueHD Video & Chapters**: Compiles a mathematically aligned black 1080p HEVC video (`Album_Video.mkv`) with **direct native chapter embedding** alongside a standalone `Album_Chapters.txt` map for seamless MKVToolNix container muxing.
 * **Parallelism**: Throttled multi-threading to maximise CPU throughput without inducing I/O thrashing.
 * **Metadata**: Preserves all source tags, artwork, and speaker layouts from the original DSF.
 
@@ -39,7 +41,7 @@ This pipeline eradicates these issues by treating the disc as a single, unbroken
 
 ## Requirements
 
-* **PowerShell**: 7.6.1+.
+* **PowerShell**: 7.6.2+.
 * **dsd2dxd**: Must be in your system PATH.
 * **FFmpeg**: 8.1+ (required for the pan filter logic and stable RF64 handling).
 
@@ -50,9 +52,13 @@ This pipeline eradicates these issues by treating the disc as a single, unbroken
 Place the script in a directory containing your .dsf files. The script autonomously identifies disc groups based on directory structure or track numbering.
 
 Standard Interactive Mode:
-.\DSFtoFLAC.ps1
+```powershell
+& '.\DSFtoFLAC&PCM via dsd2dxd (ready to go to TrueHD).ps1'
+```
 
-Automated Pipeline (FLAC + TrueHD Stems):
-.\DSFtoFLAC.ps1 -DoFLAC -TrueHD
+Automated Pipeline (FLAC + TrueHD Stems + Alignment Video & Chapters):
+```powershell
+& '.\DSFtoFLAC&PCM via dsd2dxd (ready to go to TrueHD).ps1' -DoFLAC -TrueHD
+```
 
 ---
