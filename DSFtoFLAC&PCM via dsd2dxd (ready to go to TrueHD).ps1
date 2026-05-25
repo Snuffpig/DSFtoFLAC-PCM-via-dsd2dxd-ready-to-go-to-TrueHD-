@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
-    Version: v1.0.3
+    Version: v1.0.4
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -71,7 +71,7 @@
 
 .NOTES
     Requirements:
-        PowerShell 7.6.1+
+        PowerShell 7.6.2+
         dsd2dxd  (in PATH)
         ffmpeg   8.1+  (in PATH)
           — channelmap channel_layout was removed in 6.0; pan filter required
@@ -86,7 +86,7 @@ param(
 [bool]$runFlac   = $DoFLAC.IsPresent
 [bool]$runTrueHD = $TrueHD.IsPresent
 
-#Requires -Version 7.6.1
+#Requires -Version 7.6.2
 
 $PSNativeCommandUseErrorActionPreference = $true
 $PSNativeCommandArgumentPassing = 'Standard'
@@ -897,8 +897,16 @@ if ($discCount -gt 1) {
     Write-Host ""
     for ($d = 0; $d -lt $discCount; $d++) {
         $g      = $discGroups[$d]
-        $reason = if ($d -lt $groupReasons.Count) { "  [$($groupReasons[$d])]" } else { '' }
-        Write-Host "    Group $($d+1): $($g[0].Name) → $($g[$g.Count-1].Name)  ($($g.Count) track(s))$reason" -ForegroundColor Magenta
+        $reason = if ($d -lt $groupReasons.Count) { " [Split reason: $($groupReasons[$d])]" } else { '' }
+        
+        Write-Host "    Group $($d+1):" -NoNewline -ForegroundColor Magenta
+        Write-Host " $($g.Count) track(s)" -NoNewline -ForegroundColor White
+        if ($reason) { Write-Host $reason -ForegroundColor DarkYellow } else { Write-Host "" }
+        
+        Write-Host "      Range : " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($g[0].Name)" -ForegroundColor Gray
+        Write-Host "              → $($g[$g.Count-1].Name)" -ForegroundColor Gray
+        Write-Host ""
     }
     Write-Host ""
 } else {
@@ -2266,6 +2274,183 @@ if ($runTrueHD) {
     Write-Host "$(Format-Bytes $chaptersSize)" -NoNewline -ForegroundColor Cyan
     Write-Host ")" -ForegroundColor DarkGray
     Write-Host ""
+
+    # ── Generate Black 1080p Video ────────────────────────────────────────────
+    Write-Host "  Calculating exact video frames for alignment..." -ForegroundColor Yellow
+    
+    $dataBytes = [int64]-1
+    if (Test-Path -LiteralPath $monolithWav) {
+        try {
+            $wavStream = [System.IO.FileStream]::new($monolithWav, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            try {
+                $ds64DataSz = [int64]-1
+                $chunkPos   = [int64]12
+                $walkBuf    = [byte[]]::new(8)
+                while ($chunkPos -lt ($wavStream.Length - 8)) {
+                    $wavStream.Position = $chunkPos
+                    $bytesRead = $wavStream.Read($walkBuf, 0, 8)
+                    if ($bytesRead -lt 8) { break }
+                    $chunkId   = [System.Text.Encoding]::ASCII.GetString($walkBuf, 0, 4)
+                    $chunkSize = [BitConverter]::ToUInt32($walkBuf, 4)
+                    if ($chunkId -eq 'ds64') {
+                        $ds64Buf = [byte[]]::new(16)
+                        [void]$wavStream.Read($ds64Buf, 0, 16)
+                        $ds64DataSz = [BitConverter]::ToInt64($ds64Buf, 8)
+                    } elseif ($chunkId -eq 'data') {
+                        if ($ds64DataSz -ge 0) {
+                            $dataBytes = $ds64DataSz
+                        } else {
+                            $dataBytes = [int64]$chunkSize
+                        }
+                        break
+                    }
+                    $chunkPos += 8 + $chunkSize
+                    if ($chunkSize % 2 -ne 0) { $chunkPos++ }
+                }
+            } finally { $wavStream.Close() }
+        } catch {
+            Write-Host "  [WARN] Failed to parse WAV header: $_" -ForegroundColor Yellow
+        }
+    }
+
+    if ($dataBytes -lt 0) {
+        Write-Host "  [WARN] WAV header parsing failed or file missing. Falling back to theoretical sample count." -ForegroundColor Yellow
+        $finalTrack = $trackMap[$trackMap.Count - 1]
+        $audioFrames = $finalTrack.PcmEnd
+    } else {
+        $bytesPerFrame = $stemCount * 3
+        $audioFrames = [math]::Floor($dataBytes / $bytesPerFrame)
+    }
+
+    # 1 video frame @ 25 fps matches exactly 3840 audio samples @ 96000 Hz.
+    # Ceiling division ensures the video is either exact or slightly longer by < 40 ms.
+    $videoFrames = [math]::Ceiling($audioFrames / 3840)
+
+    $exactAudioDur = $audioFrames / $PCM_RATE
+    $exactVideoDur = $videoFrames / 25
+    $diffMs        = [math]::Round(($exactVideoDur - $exactAudioDur) * 1000, 3)
+
+    Write-Host "  Video alignment properties:" -ForegroundColor Gray
+    Write-Host "    Audio Frames     : $(Format-N $audioFrames) samples/ch" -ForegroundColor Gray
+    Write-Host "    Video Frames     : $(Format-N $videoFrames) frames @ 25 fps" -ForegroundColor Gray
+    Write-Host "    Audio Duration   : $(Format-Ts $exactAudioDur) (${exactAudioDur} s)" -ForegroundColor Gray
+    Write-Host "    Video Duration   : $(Format-Ts $exactVideoDur) (${exactVideoDur} s)" -ForegroundColor Gray
+    if ($diffMs -eq 0) {
+        Write-Host "    Alignment        : PERFECT (0.000 ms padding)" -ForegroundColor Green
+    } else {
+        Write-Host "    Alignment        : Video is slightly longer by ${diffMs} ms (compliant with specs)" -ForegroundColor Green
+    }
+    Write-Host ""
+
+    # Generate a temporary FFMETADATA1 file containing the embedded chapters
+    Write-Host "  Preparing metadata for direct chapter encoding..." -ForegroundColor Yellow
+    $metaFile = Join-Path $scriptDir "_metadata.txt"
+    try {
+        $metaLines = [System.Collections.Generic.List[string]]::new()
+        $metaLines.Add(";FFMETADATA1")
+        $metaLines.Add("title=Album Video")
+        for ($i = 0; $i -lt $trackMap.Count; $i++) {
+            $entry = $trackMap[$i]
+            $startMs = [math]::Round(($entry.PcmStart / $PCM_RATE) * 1000)
+            $endMs = [math]::Round(($entry.PcmEnd / $PCM_RATE) * 1000)
+            $rawTitle  = Get-ChapterTitle $entry.Name
+
+            $metaLines.Add("[CHAPTER]")
+            $metaLines.Add("TIMEBASE=1/1000")
+            $metaLines.Add("START=$startMs")
+            $metaLines.Add("END=$endMs")
+            $metaLines.Add("title=$rawTitle")
+        }
+        [System.IO.File]::WriteAllLines($metaFile, $metaLines, [System.Text.UTF8Encoding]::new($false))
+    } catch {
+        Write-Host "  [WARN] Failed to generate temporary metadata file: $_" -ForegroundColor Yellow
+    }
+    Write-Host ""
+
+    $videoFile = Join-Path $scriptDir "Album_Video.mkv"
+    $tempBlack = Join-Path $scriptDir "_temp_black.mkv"
+    Write-Host "  Generating black 1080p HEVC video with embedded chapters -> Album_Video.mkv ..." -ForegroundColor Yellow
+    
+    $videoTimer = [System.Diagnostics.Stopwatch]::StartNew()
+    
+    # 1. Encode a 1-second seed video at 25 fps with default GOP and high quantization (CRF/QP 40)
+    # This takes a fraction of a second and results in a highly optimized file.
+    $seedSuccess = $true
+    $ffSeedArgs = @(
+        '-hide_banner','-v','error','-y',
+        '-f','lavfi','-i','color=c=black:s=1920x1080:r=25',
+        '-t','1',
+        '-c:v','hevc_nvenc',
+        '-preset','fast',
+        '-qp','40',
+        '-pix_fmt','yuv420p',
+        $tempBlack
+    )
+
+    $videoOut = & ffmpeg @ffSeedArgs 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [WARN] NVENC HEVC seed generation failed. Falling back to ultra-fast CPU libx265..." -ForegroundColor Yellow
+        $ffSeedFallbackArgs = @(
+            '-hide_banner','-v','error','-y',
+            '-f','lavfi','-i','color=c=black:s=1920x1080:r=25',
+            '-t','1',
+            '-c:v','libx265',
+            '-preset','ultrafast',
+            '-crf','40',
+            '-pix_fmt','yuv420p',
+            $tempBlack
+        )
+        $videoOut = & ffmpeg @ffSeedFallbackArgs 2>&1
+        if ($LASTEXITCODE -ne 0) { $seedSuccess = $false }
+    }
+
+    # 2. If seed video was generated successfully, infinitely loop-copy it using the stream copy demuxer.
+    # This runs at pure disk I/O speeds (instantaneous) and maps the FFMETADATA1 chapters.
+    if ($seedSuccess -and (Test-Path -LiteralPath $tempBlack)) {
+        $ffLoopArgs = @(
+            '-hide_banner','-v','error','-y',
+            '-stream_loop','-1',
+            '-i',$tempBlack,
+            '-i',$metaFile,
+            '-map_metadata','1',
+            '-frames:v',[string]$videoFrames,
+            '-c:v','copy',
+            $videoFile
+        )
+        $videoOut = & ffmpeg @ffLoopArgs 2>&1
+    } else {
+        $LASTEXITCODE = 1
+    }
+
+    $videoTimer.Stop()
+
+    # Clean up temporary files
+    Remove-Item -LiteralPath $tempBlack -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $metaFile -Force -ErrorAction SilentlyContinue
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  [WARN] ffmpeg black video generation failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+        if ($videoOut) { $videoOut | ForEach-Object { Write-Host "    >> $_" -ForegroundColor DarkRed } }
+    } else {
+        $videoSize = (Get-Item -LiteralPath $videoFile).Length
+        $el = $videoTimer.Elapsed
+        $elStr = if ($el.TotalMinutes -ge 1) {
+            "{0}m {1}s" -f [math]::Floor($el.TotalMinutes), $el.Seconds
+        } else {
+            "{0:F1}s" -f $el.TotalSeconds
+        }
+
+        Write-Host "    [" -NoNewline -ForegroundColor DarkGray
+        Write-Host "OK" -NoNewline -ForegroundColor Green
+        Write-Host "] " -NoNewline -ForegroundColor DarkGray
+        Write-Host "Album_Video.mkv written with embedded chapters" -NoNewline -ForegroundColor White
+        Write-Host " (" -NoNewline -ForegroundColor DarkGray
+        Write-Host "$(Format-Bytes $videoSize)" -NoNewline -ForegroundColor Cyan
+        Write-Host " in " -NoNewline -ForegroundColor DarkGray
+        Write-Host $elStr -NoNewline -ForegroundColor Green
+        Write-Host ")" -ForegroundColor DarkGray
+    }
+    Write-Host ""
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2313,6 +2498,18 @@ if ($runTrueHD) {
     Write-Host " × discrete mono " -NoNewline -ForegroundColor Gray
     Write-Host $STEM_CODEC -NoNewline -ForegroundColor White
     Write-Host " WAV stems written for TrueHD mux." -ForegroundColor Gray
+
+    Write-Host "  " -NoNewline
+    Write-Host "1" -NoNewline -ForegroundColor Cyan
+    Write-Host " × black 1080p HEVC video (" -NoNewline -ForegroundColor Gray
+    Write-Host "Album_Video.mkv" -NoNewline -ForegroundColor White
+    Write-Host ") written for MKV muxing." -ForegroundColor Gray
+
+    Write-Host "  " -NoNewline
+    Write-Host "1" -NoNewline -ForegroundColor Cyan
+    Write-Host " × MKVToolNix chapters (" -NoNewline -ForegroundColor Gray
+    Write-Host "Album_Chapters.txt" -NoNewline -ForegroundColor White
+    Write-Host ") written." -ForegroundColor Gray
 }
 Write-Host ""
 if ($runFlac) {
