@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
-    Version: v1.0.5
+    Version: v1.0.6
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -136,8 +136,8 @@ Write-Host "║" -ForegroundColor DarkCyan
 Write-Host " ╟──────────────────────────────────────────────────────────╢" -ForegroundColor DarkCyan
 Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
 Write-Host "  Engine: " -NoNewline -ForegroundColor DarkGray
-Write-Host "dsd2dxd v1.0.2" -NoNewline -ForegroundColor White
-Write-Host "                " -NoNewline
+Write-Host "dsd2dxd" -NoNewline -ForegroundColor White
+Write-Host "                       " -NoNewline
 Write-Host "Parallel: " -NoNewline -ForegroundColor DarkGray
 Write-Host "Active" -NoNewline -ForegroundColor Green
 Write-Host "  ║" -ForegroundColor DarkCyan
@@ -149,6 +149,9 @@ foreach ($tool in @('dsd2dxd','ffmpeg')) {
         Write-Host "FATAL: '$tool' not found in PATH. Aborting." -ForegroundColor Red; exit 1
     }
 }
+
+$dsdVersionLine = & dsd2dxd --version 2>&1 | Select-Object -First 1
+Write-Host "  $dsdVersionLine" -ForegroundColor DarkGray
 
 # Enforce FFmpeg 8.1 minimum.
 # Earlier builds lack the pan filter improvements used in Phase 4 and have the
