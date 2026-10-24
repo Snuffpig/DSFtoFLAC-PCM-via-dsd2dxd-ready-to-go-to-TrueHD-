@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Gapless DSD-to-FLAC pipeline with optional TrueHD stem preparation.
-    Version: v1.0.6
+    Version: v1.0.7
 
 .DESCRIPTION
     Processes DSF tracks as one or more monolithic streams through dsd2dxd's
@@ -120,7 +120,7 @@ $FLAC_THROTTLE  = [math]::Min(4, [Environment]::ProcessorCount)
 # INITIALISATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if ($scriptDir) { Set-Location -LiteralPath $scriptDir }
 
 Write-Host ""
@@ -128,8 +128,10 @@ Write-Host " ╔═════════════════════�
 Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
 Write-Host "  DSF" -NoNewline -ForegroundColor White
 Write-Host " → " -NoNewline -ForegroundColor DarkCyan
-Write-Host "GAPLESS FLAC & TRUEHD STEMS                       " -NoNewline -ForegroundColor Cyan
-Write-Host "║" -ForegroundColor DarkCyan
+Write-Host "GAPLESS FLAC & TRUEHD STEMS" -NoNewline -ForegroundColor Cyan
+Write-Host "               " -NoNewline
+Write-Host "v1.0.7" -NoNewline -ForegroundColor Yellow
+Write-Host "  ║" -ForegroundColor DarkCyan
 Write-Host " ║" -NoNewline -ForegroundColor DarkCyan
 Write-Host "  Audiophile decimation & gapless slicing pipeline        " -NoNewline -ForegroundColor Gray
 Write-Host "║" -ForegroundColor DarkCyan
@@ -157,8 +159,8 @@ Write-Host "  $dsdVersionLine" -ForegroundColor DarkGray
 # Earlier builds lack the pan filter improvements used in Phase 4 and have the
 # channelmap channel_layout option removed in 6.0 — a fatal error on any older build.
 $ffVersionLine = & ffmpeg -version 2>&1 | Select-Object -First 1
-# Version line format: "ffmpeg version 8.1 Copyright ..."
-if ($ffVersionLine -match 'ffmpeg version (\d+)\.(\d+)') {
+# Version line format: "ffmpeg version 8.1 Copyright ..." (or "ffmpeg version n8.1-...")
+if ($ffVersionLine -match 'ffmpeg version [nN]?(\d+)\.(\d+)') {
     $ffMajor = [int]$Matches[1]
     $ffMinor = [int]$Matches[2]
     if ($ffMajor -lt 8 -or ($ffMajor -eq 8 -and $ffMinor -lt 1)) {
@@ -176,15 +178,16 @@ if ($ffVersionLine -match 'ffmpeg version (\d+)\.(\d+)') {
 # FILE DISCOVERY
 # ══════════════════════════════════════════════════════════════════════════════
 
-$dsfFiles = Get-ChildItem -Filter *.dsf -Recurse |
+$dsfFiles = Get-ChildItem -LiteralPath $scriptDir -Filter *.dsf -Recurse |
     Where-Object { $_.Name -notmatch '^(Album|Disc\d+)_Monolithic\.dsf$' } |
     Sort-Object -Property @(
-        # Primary key: natural numeric sort on all integer sequences in the full path.
-        # Ensures CD2 sorts before CD10 (lexicographic sort would put CD10 first).
-        { [regex]::Matches($_.FullName, '\d+') | ForEach-Object { [int]$_.Value } },
+        # Primary key: natural numeric sort via in-place 20-digit zero-padding.
+        # Produces a single IComparable string (unlike [regex]::Matches arrays which
+        # PowerShell's Sort-Object collapses to "System.Object[]" and ignores), avoids
+        # Int32 overflow on 10+ digit catalog/EAN numbers in folder names, and keeps
+        # surrounding text in place so "Side A - Track 2" stays before "Side B - Track 1".
+        { [regex]::Replace($_.FullName, '\d+', { $args[0].Value.PadLeft(20, '0') }) },
         # Secondary key: standard string sort to break ties deterministically.
-        # Required for non-numeric naming (e.g., "Side A - Track 1.dsf" vs
-        # "Side B - Track 1.dsf") where both numeric arrays are identical.
         { $_.FullName }
     )
 
@@ -260,11 +263,14 @@ function Format-N {
 }
 
 # Format a raw second count as M:SS.mmm for human-readable timestamps.
+# Rounds total milliseconds upfront so fractional seconds >= .9995 carry cleanly
+# into seconds/minutes instead of rounding $ms to 1000 ("0:59.1000").
 function Format-Ts {
     param([double]$Seconds)
-    $m   = [int][math]::Floor($Seconds / 60)
-    $s   = [int][math]::Floor($Seconds % 60)
-    $ms  = [int](($Seconds % 1) * 1000)
+    $totalMs = [int64][math]::Round($Seconds * 1000)
+    $m       = [int][math]::Floor($totalMs / 60000)
+    $s       = [int][math]::Floor(($totalMs % 60000) / 1000)
+    $ms      = [int]($totalMs % 1000)
     return "{0}:{1:D2}.{2:D3}" -f $m, $s, $ms
 }
 
@@ -289,15 +295,16 @@ function Format-ChapterTs {
 function Get-ChapterTitle {
     param([string]$FileName)
     $title = [System.IO.Path]::GetFileNameWithoutExtension($FileName)
-    $pattern = '^\s*(?:(?:(?:CD|Disc|Disk|Vol|Volume|Part)\s*\d+\s*[-._]?\s*\d+\s*[-.]?\s*)|(?:\d+-\d+\s*[-._]?\s*)|(?:\d+\s*[-.]\s*)|(?:\d{2,}\s+))'
+    $pattern = '^\s*(?:(?:(?:CD|Disc|Disk|Vol|Volume|Part)\s*\d+\s*[-._]?\s*\d+\s*(?:[-._]\s*|\s+))|(?:\d{1,2}-\d{2}\s*(?:[-._]\s*|\s+))|(?:\d+\s*[-._]\s*)|(?:\d{2,}\s+))'
     $title = $title -replace $pattern, ''
     return $title.Trim()
 }
 
-# Inline C# DSP helper — compiled once at startup via Add-Type.
-# PowerShell's interpreted for-loop is too slow for high-frequency sample maths:
-# a 250ms 5.1/96kHz fade requires ~860K iterations with bitwise ops per pass.
-# This C# class executes the identical linear fade on the CLR in milliseconds.
+# Inline C# DSP & Planar Shift helpers — compiled once at startup via Add-Type.
+# PowerShell's interpreted loops are too slow for high-frequency sample/block maths:
+# - A 250ms 5.1/96kHz fade requires ~860K iterations with bitwise ops per pass.
+# - A 60-minute DSD64 album requires ~310K planar block-shift iterations (~1.24M for DSD256).
+# These C# classes execute both in native JIT-compiled CLR code at raw memory/NVMe speed.
 #
 # Guard logic: Add-Type loads types permanently into the AppDomain and cannot
 # redefine them. A simple type-name check is insufficient: if an earlier
@@ -379,6 +386,111 @@ public static class DspHelper {
 '@ -Language CSharp
 }
 
+$_planarNeedsCompile = $true
+$_planarExisting = 'PlanarShiftHelper' -as [type]
+if ($_planarExisting) {
+    $_planarMethods = $_planarExisting.GetMethods() | Select-Object -ExpandProperty Name
+    if (($_planarMethods -contains 'StreamTrack') -and ($_planarMethods -contains 'FlushTail')) {
+        $_planarNeedsCompile = $false
+    }
+}
+if ($_planarNeedsCompile) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.IO;
+public static class PlanarShiftHelper {
+    /// <summary>
+    /// Streams valid per-channel DSD bytes from <paramref name="inStream"/> into per-channel
+    /// ring buffers <paramref name="chanBufs"/>, interleaving and flushing full 4096-byte
+    /// planar blocks to <paramref name="outStream"/> while carrying residual bytes across tracks.
+    /// Enforces strict block-alignment truncation guards including on exact block boundaries.
+    /// </summary>
+    public static ulong StreamTrack(
+        FileStream inStream,
+        FileStream outStream,
+        byte[][] chanBufs,
+        byte[] interleaved,
+        byte[] readBuf,
+        int channelCount,
+        int blockSzPerChan,
+        ulong validBytesPerChan,
+        ref int buffered,
+        string trackName
+    ) {
+        int blockSize = channelCount * blockSzPerChan;
+        ulong remainingValid = validBytesPerChan;
+        ulong writtenPayload = 0;
+
+        while (remainingValid > 0) {
+            int bytesRead = 0;
+            while (bytesRead < blockSize) {
+                int chunk = inStream.Read(readBuf, bytesRead, blockSize - bytesRead);
+                if (chunk == 0) break;
+                bytesRead += chunk;
+            }
+            if (bytesRead < blockSize && remainingValid > 0) {
+                throw new InvalidDataException(
+                    string.Format(
+                        "Planar block underrun: read {0} of {1} bytes with {2} valid bytes still expected. Source file '{3}' appears truncated — aborting to prevent stale-buffer corruption.",
+                        bytesRead, blockSize, remainingValid, trackName
+                    )
+                );
+            }
+            ulong samplesInRead = (ulong)(bytesRead / channelCount);
+            ulong min1 = samplesInRead < remainingValid ? samplesInRead : remainingValid;
+            int validInThisBlock = (int)((ulong)blockSzPerChan < min1 ? (ulong)blockSzPerChan : min1);
+
+            for (int c = 0; c < channelCount; c++) {
+                Buffer.BlockCopy(readBuf, c * blockSzPerChan, chanBufs[c], buffered, validInThisBlock);
+            }
+            buffered += validInThisBlock;
+            remainingValid -= (ulong)validInThisBlock;
+
+            if (buffered >= blockSzPerChan) {
+                int leftover = buffered - blockSzPerChan;
+                for (int c = 0; c < channelCount; c++) {
+                    Buffer.BlockCopy(chanBufs[c], 0, interleaved, c * blockSzPerChan, blockSzPerChan);
+                    if (leftover > 0) {
+                        Buffer.BlockCopy(chanBufs[c], blockSzPerChan, chanBufs[c], 0, leftover);
+                    }
+                }
+                outStream.Write(interleaved, 0, blockSize);
+                writtenPayload += (ulong)blockSize;
+                buffered -= blockSzPerChan;
+            }
+        }
+        return writtenPayload;
+    }
+
+    /// <summary>
+    /// Flushes residual buffered DSD bytes at the end of a disc, padding the remainder
+    /// of each 4096-byte channel plane with <paramref name="padByte"/> (0x69).
+    /// </summary>
+    public static ulong FlushTail(
+        FileStream outStream,
+        byte[][] chanBufs,
+        byte[] interleaved,
+        int channelCount,
+        int blockSzPerChan,
+        int buffered,
+        byte padByte
+    ) {
+        if (buffered <= 0) return 0;
+        int blockSize = channelCount * blockSzPerChan;
+        for (int c = 0; c < channelCount; c++) {
+            int baseOff = c * blockSzPerChan;
+            Buffer.BlockCopy(chanBufs[c], 0, interleaved, baseOff, buffered);
+            for (int b = buffered; b < blockSzPerChan; b++) {
+                interleaved[baseOff + b] = padByte;
+            }
+        }
+        outStream.Write(interleaved, 0, blockSize);
+        return (ulong)blockSize;
+    }
+}
+'@ -Language CSharp
+}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -424,6 +536,14 @@ for ($i = 0; $i -lt $fileCount; $i++) {
     } finally { $fs.Close() }
     $fileFail = $false
 
+    if ($bytesHdr -lt $HEADER_SIZE) {
+        Write-Check 'Header size' $FAIL "= $bytesHdr bytes (minimum 92-byte DSF header required — file truncated)"
+        $fileFail = $true; $globalFail = $true
+        Write-Host ""; Write-Host "  *** One or more checks FAILED for this file. ***" -ForegroundColor Red
+        Write-Host ""
+        continue
+    }
+
     # 1. Magic bytes
     foreach ($chk in @(
         @{ L='DSD magic @ 0x00';  Got=(Get-AsciiAt $raw $DSD_MAGIC_OFFSET  4); Exp='DSD ' },
@@ -467,10 +587,10 @@ for ($i = 0; $i -lt $fileCount; $i++) {
     if ($fmtId -eq 0) { Write-Check 'Format ID @ 0x2C' $PASS "= $fmtId (DSD raw 1-bit)" }
     else { Write-Check 'Format ID @ 0x2C' $FAIL "= $fmtId (expected 0 — NOT raw 1-bit DSD)"; $fileFail=$true; $globalFail=$true }
 
-    # 8. Channel count
+    # 8. Channel count (Sony DSF spec v1.01 and dsd2dxd strictly require 1..6 channels)
     $chanCount = [BitConverter]::ToUInt32($raw, $CHAN_COUNT_OFFSET)
-    if ($chanCount -ge 1 -and $chanCount -le 8) { Write-Check 'Channel count @ 0x34' $PASS "= $chanCount" }
-    else { Write-Check 'Channel count @ 0x34' $FAIL "= $chanCount (implausible)"; $fileFail=$true; $globalFail=$true }
+    if ($chanCount -ge 1 -and $chanCount -le 6) { Write-Check 'Channel count @ 0x34' $PASS "= $chanCount" }
+    else { Write-Check 'Channel count @ 0x34' $FAIL "= $chanCount (Sony DSF spec & dsd2dxd require 1–6)"; $fileFail=$true; $globalFail=$true }
 
     # 9. Sample frequency
     $sampleFreq = [BitConverter]::ToUInt32($raw, $SAMPLE_FREQ_OFFSET)
@@ -492,18 +612,25 @@ for ($i = 0; $i -lt $fileCount; $i++) {
 
     # 12. Payload size
     $hdrPayloadSize = [BitConverter]::ToUInt64($raw, $DATA_SIZE_OFFSET)
-    $hdrAudioBytes  = if ($hdrPayloadSize -ge 12) { $hdrPayloadSize - 12 } else { 0 }
+    $hdrAudioBytes  = if ($hdrPayloadSize -ge 12) { $hdrPayloadSize - 12 } else { [uint64]0 }
     # Physical reference: prefer ID3 pointer (if valid) as the practical file boundary;
     # fall back to physical file size. Used for informational comparison only — NOT
     # for structural validation (which uses $hdrAudioBytes / DATA_SIZE_OFFSET exclusively).
-    $payloadEnd     = if ($id3Ptr -ne 0 -and $id3Ptr -gt [uint64]$HEADER_SIZE) { [long]$id3Ptr } else { $fileSize }
-    $derivedPayload = [uint64]($payloadEnd - $HEADER_SIZE)  # physical/id3-based reference (informational only)
+    $payloadEnd     = if ($id3Ptr -ne 0 -and $id3Ptr -gt [uint64]$HEADER_SIZE -and $id3Ptr -le [uint64]$fileSize) { [long]$id3Ptr } else { $fileSize }
+    $derivedPayload = [uint64]($payloadEnd - $HEADER_SIZE)  # physical/id3-based reference
+    $physicalMaxPayload = [uint64]($fileSize - $HEADER_SIZE)
     # DATA_SIZE_OFFSET is the singular Scarlet Book ground truth — same source as Phase 1.
-    # A corrupt ID3 pointer that undershoots the true audio end would make $derivedPayload
-    # smaller than $hdrAudioBytes, causing false FAIL in block-alignment and padding checks.
+    # However, if DATA_SIZE exceeds the physical bytes present on disk ($physicalMaxPayload),
+    # the file is physically truncated and Phase 1 would fail mid-stream: flag FAIL upfront.
     $actualPayload  = $hdrAudioBytes
-    if ($hdrAudioBytes -eq $derivedPayload) { Write-Check 'Payload size @ 0x54' $PASS "= $(Format-N $hdrAudioBytes) audio bytes ($(Format-Bytes $hdrAudioBytes))" }
-    else { Write-Check 'Payload size @ 0x54' $WARN "DATA_SIZE=$(Format-N $hdrAudioBytes) ($(Format-Bytes $hdrAudioBytes)), PhysicalBound=$(Format-N $derivedPayload) — ID3 pointer or file truncation mismatch; using DATA_SIZE as authoritative" }
+    if ($hdrPayloadSize -lt 12 -or $hdrAudioBytes -gt $physicalMaxPayload) {
+        Write-Check 'Payload size @ 0x54' $FAIL "DATA_SIZE=$(Format-N $hdrAudioBytes) ($(Format-Bytes $hdrAudioBytes)) exceeds physical disk payload $(Format-N $physicalMaxPayload) — file is truncated"
+        $fileFail = $true; $globalFail = $true
+    } elseif ($hdrAudioBytes -eq $derivedPayload) {
+        Write-Check 'Payload size @ 0x54' $PASS "= $(Format-N $hdrAudioBytes) audio bytes ($(Format-Bytes $hdrAudioBytes))"
+    } else {
+        Write-Check 'Payload size @ 0x54' $WARN "DATA_SIZE=$(Format-N $hdrAudioBytes) ($(Format-Bytes $hdrAudioBytes)), PhysicalBound=$(Format-N $derivedPayload) — alignment gap before ID3/EOF; using DATA_SIZE as authoritative"
+    }
 
 
     # 13. Block alignment
@@ -517,16 +644,28 @@ for ($i = 0; $i -lt $fileCount; $i++) {
 
     }
 
-    # 14. Channel type
+    # 14. Channel type (Sony DSF spec v1.01 & dsd2dxd define types 1..7)
     $chanType = [BitConverter]::ToUInt32($raw, $CHAN_TYPE_OFFSET)
     $chanTypeLabel = switch ($chanType) {
-        1{'Mono'} 2{'Stereo'} 3{'3-channel'} 4{'Quad'} 5{'4-channel'}
-        6{'5-channel'} 7{'5.1 surround'} 8{'7-channel'} 9{'7.1 surround'} default{"unknown ($chanType)"}
+        1{'Mono'} 2{'Stereo'} 3{'3-channel (3.0)'} 4{'Quad (4.0)'} 5{'4-channel (3.1)'}
+        6{'5-channel (5.0)'} 7{'5.1 surround'} default{"unknown ($chanType)"}
     }
-    $expectedType = switch ($chanCount) { 1{1} 2{2} 6{7} 8{9} default{0} }
-    if ($chanType -eq $expectedType) { Write-Check 'Channel type @ 0x30' $PASS "= $chanType ($chanTypeLabel) — matches channel count" }
-    elseif ($chanType -gt 0) { Write-Check 'Channel type @ 0x30' $WARN "= $chanType ($chanTypeLabel) — verify speaker assignment" }
-    else { Write-Check 'Channel type @ 0x30' $FAIL "= $chanType — invalid value"; $fileFail=$true; $globalFail=$true }
+    $validTypesForCount = switch ($chanCount) {
+        1 { @(1) }
+        2 { @(2) }
+        3 { @(3) }
+        4 { @(4, 5) }
+        5 { @(6) }
+        6 { @(7) }
+        default { @() }
+    }
+    if ($chanType -ge 1 -and $chanType -le 7 -and ($validTypesForCount -contains $chanType)) {
+        Write-Check 'Channel type @ 0x30' $PASS "= $chanType ($chanTypeLabel) — matches channel count"
+    } elseif ($chanType -ge 1 -and $chanType -le 7) {
+        Write-Check 'Channel type @ 0x30' $WARN "= $chanType ($chanTypeLabel) — unusual for $chanCount ch; verify speaker assignment"
+    } else {
+        Write-Check 'Channel type @ 0x30' $FAIL "= $chanType — invalid value (Sony DSF spec & dsd2dxd require 1–7)"; $fileFail=$true; $globalFail=$true
+    }
 
     # 15. Sample count — this is the mathematical ground truth used for PCM boundary mapping.
     # The SampleCount declares exactly how many 1-bit audio samples were written per channel,
@@ -816,8 +955,10 @@ function Get-DiscGroup {
     }
     # Branch 2 — Bare digit-dash-digit at string start (no text prefix):
     #   "1-01 - Track.dsf", "2-03 Track.dsf"
-    #   The disc number is the integer immediately before the hyphen.
-    if ($FileName -match '^\s*(\d+)-(\d+)') {
+    #   Constrained to 1-2 digit disc number + hyphen + 2-digit track number followed
+    #   by a separator so hyphenated 4-digit title numbers (e.g. "01-1984.dsf" or
+    #   "01-2112 Overture.dsf") are never misidentified as Disc-Track prefixes.
+    if ($FileName -match '^\s*(\d{1,2})-(\d{2})(?=\s*[-._]|\s+\D|$)') {
         return [int]$matches[1]
     }
     # Branch 3 — Plain integer prefix (hundreds-encoded disc):
@@ -828,6 +969,17 @@ function Get-DiscGroup {
     return -1
 }
 
+function Get-DiscBranch {
+    param([string]$FileName)
+    # Identifies which pattern branch matched so that a filename quirk on a single
+    # track (e.g. combined track "01-02 - Intro.dsf" followed by "03 - Song.dsf")
+    # never triggers a false cross-branch disc split within the same folder.
+    if ($FileName -match '^\s*(?:CD|Disc|Disk|Vol|Volume|Part)\s*\d+') { return 1 }
+    if ($FileName -match '^\s*\d{1,2}-\d{2}(?=\s*[-._]|\s+\D|$)')     { return 2 }
+    if ($FileName -match '^\s*\d+')                                    { return 3 }
+    return 0
+}
+
 function Get-TrackSuffix {
     param([string]$FileName)
     # Returns the within-group track number (N % 100) for Branch 3 plain-integer
@@ -836,7 +988,7 @@ function Get-TrackSuffix {
     # represents a genuine track-number RESET rather than simple continuation
     # (e.g., track 099 → track 100 on a single disc with 100+ tracks).
     if ($FileName -match '^\s*(?:CD|Disc|Disk|Vol|Volume|Part)\s*\d+') { return -1 }
-    if ($FileName -match '^\s*\d+-\d+') { return -1 }
+    if ($FileName -match '^\s*\d{1,2}-\d{2}(?=\s*[-._]|\s+\D|$)')     { return -1 }
     if ($FileName -match '^\s*(\d+)') { return [int]$matches[1] % 100 }
     return -1
 }
@@ -854,10 +1006,12 @@ for ($i = 1; $i -lt $fileCount; $i++) {
     $thisDir      = [System.IO.Path]::GetDirectoryName($thisFile.FullName)
     $dirChanged   = ($prevDir -ne $thisDir)
 
-    $prevGroup = Get-DiscGroup $prevFile.Name
-    $thisGroup = Get-DiscGroup $thisFile.Name
+    $prevBranch = Get-DiscBranch $prevFile.Name
+    $thisBranch = Get-DiscBranch $thisFile.Name
+    $prevGroup  = Get-DiscGroup $prevFile.Name
+    $thisGroup  = Get-DiscGroup $thisFile.Name
     $hundredsShifted = $false
-    if ($prevGroup -ge 0 -and $thisGroup -ge 0 -and $prevGroup -ne $thisGroup) {
+    if ($prevBranch -gt 0 -and $prevBranch -eq $thisBranch -and $prevGroup -ge 0 -and $thisGroup -ge 0 -and $prevGroup -ne $thisGroup) {
         $prevSuffix = Get-TrackSuffix $prevFile.Name
         $thisSuffix = Get-TrackSuffix $thisFile.Name
         if ($prevSuffix -ge 0 -and $thisSuffix -ge 0) {
@@ -875,7 +1029,7 @@ for ($i = 1; $i -lt $fileCount; $i++) {
             $thisRaw         = $thisGroup * 100 + $thisSuffix
             $hundredsShifted = (($thisRaw - $prevRaw) -ne 1)
         } else {
-            # Branch 1 or 2: any group-key change is always a disc boundary.
+            # Branch 1 or 2: any group-key change within the same naming scheme is a disc boundary.
             $hundredsShifted = $true
         }
     }
@@ -1034,7 +1188,7 @@ for ($d = 0; $d -lt $discCount; $d++) {
     for ($c = 0; $c -lt $channelCount; $c++) { $chanBufs[$c] = [byte[]]::new($blockSzPerChan * 2) }
     $interleaved     = [byte[]]::new($blockSize)
     $readBuf         = [byte[]]::new($blockSize)
-    $buffered        = 0
+    [int]$buffered   = 0
     $totalPayload    = [uint64]0
     $discSampleCount = [uint64]0
 
@@ -1097,48 +1251,22 @@ for ($d = 0; $d -lt $discCount; $d++) {
                     Write-Host "      [WARN] SampleCount exceeds payload — clamping padding to 0." -ForegroundColor Yellow
                     [uint64]0
                 }
-                $fs.Position    = $HEADER_SIZE
-                $remainingValid = $validBytesPerChan
-                while ($remainingValid -gt 0) {
-                    $bytesRead = 0
-                    while ($bytesRead -lt $blockSize) {
-                        $chunk = $fs.Read($readBuf, $bytesRead, $blockSize - $bytesRead)
-                        if ($chunk -eq 0) { break }
-                        $bytesRead += $chunk
-                    }
-                    if ($bytesRead -eq 0) { break }
-                    # Planar truncation guard: DSD on disk is laid out as N×4096-byte
-                    # channel planes (all bytes of ch0, then all of ch1, …). A partial
-                    # read that fills fewer than $blockSize bytes does NOT distribute the
-                    # shortfall evenly — ch0 is full and higher channels are absent or
-                    # clipped. $samplesInRead would then be too small for ch0 and wrong
-                    # for all others. Array::Copy at offset $c*$blockSzPerChan for the
-                    # starved channels reads stale data from the previous loop iteration's
-                    # $readBuf allocation, silently baking garbage into the output stream.
-                    # A partial block mid-stream means the source file is physically
-                    # severed. Abort immediately rather than corrupt the monolithic DSF.
-                    if ($bytesRead -lt $blockSize -and $remainingValid -gt 0) {
-                        throw "Planar block underrun: read $bytesRead of $blockSize bytes with $remainingValid valid bytes still expected. Source file '$($track.Name)' appears truncated — aborting to prevent stale-buffer corruption."
-                    }
-                    
-                    $samplesInRead    = [Math]::DivRem([ulong]$bytesRead, [ulong]$channelCount).Item1
-                    $validInThisBlock = [math]::Min([uint64]$blockSzPerChan, [math]::Min($samplesInRead, $remainingValid))
-                    for ($c = 0; $c -lt $channelCount; $c++) {
-                        [Array]::Copy($readBuf, $c * $blockSzPerChan, $chanBufs[$c], $buffered, $validInThisBlock)
-                    }
-                    $buffered       += $validInThisBlock
-                    $remainingValid -= $validInThisBlock
-                    if ($buffered -ge $blockSzPerChan) {
-                        for ($c = 0; $c -lt $channelCount; $c++) {
-                            [Array]::Copy($chanBufs[$c], 0, $interleaved, $c * $blockSzPerChan, $blockSzPerChan)
-                            $leftover = $buffered - $blockSzPerChan
-                            if ($leftover -gt 0) { [Array]::Copy($chanBufs[$c], $blockSzPerChan, $chanBufs[$c], 0, $leftover) }
-                        }
-                        $outStream.Write($interleaved, 0, $blockSize)
-                        $totalPayload += $blockSize
-                        $buffered     -= $blockSzPerChan
-                    }
-                }
+                $fs.Position = $HEADER_SIZE
+                # Execute True Planar Shift via JIT-compiled C# (PlanarShiftHelper).
+                # Performs all 4096-byte planar block de-interleaving, ring-buffer carry,
+                # and block-alignment underrun validation at native CLR memory speed.
+                $totalPayload += [PlanarShiftHelper]::StreamTrack(
+                    $fs,
+                    $outStream,
+                    $chanBufs,
+                    $interleaved,
+                    $readBuf,
+                    [int]$channelCount,
+                    [int]$blockSzPerChan,
+                    [uint64]$validBytesPerChan,
+                    [ref]$buffered,
+                    $track.Name
+                )
                     if ($paddingBytes -gt 0 -and $albumSampleHz -gt 0) {
                         $padMs = [math]::Round($paddingBytes * 8 / $albumSampleHz * 1000, 4)
                         Write-Host "      Payload streamed : " -NoNewline -ForegroundColor DarkGray
@@ -1193,12 +1321,15 @@ for ($d = 0; $d -lt $discCount; $d++) {
         # click in the PCM at the disc tail. Phase 2 eliminates this with a
         # 250ms fade-out applied unconditionally to the tail of every disc WAV.
         if ($buffered -gt 0) {
-            for ($c = 0; $c -lt $channelCount; $c++) {
-                [Array]::Copy($chanBufs[$c], 0, $interleaved, $c * $blockSzPerChan, $buffered)
-                for ($b = $buffered; $b -lt $blockSzPerChan; $b++) { $interleaved[$c * $blockSzPerChan + $b] = 0x69 }
-            }
-            $outStream.Write($interleaved, 0, $blockSize)
-            $totalPayload += $blockSize
+            $totalPayload += [PlanarShiftHelper]::FlushTail(
+                $outStream,
+                $chanBufs,
+                $interleaved,
+                [int]$channelCount,
+                [int]$blockSzPerChan,
+                [int]$buffered,
+                [byte]0x69
+            )
             if ($albumSampleHz -gt 0) {
                 $padMs = [math]::Round(($blockSzPerChan - $buffered) * 8 / $albumSampleHz * 1000, 4)
                 Write-Host "    Final flush      : " -NoNewline -ForegroundColor DarkGray
@@ -1379,20 +1510,22 @@ if ($discCount -gt 1) {
 }
 
 $job = 0..($discCount - 1) | ForEach-Object -Parallel {
-    $d            = $_
-    $_dsfPaths    = $using:discDsfPaths   # $using: cannot contain subscript expressions
-    $_wavPaths    = $using:discWavPaths   # capture the list, then index locally
-    $discDsfPath  = $_dsfPaths[$d]
-    $discWavPath  = $_wavPaths[$d]
-    $discCount    = $using:discCount
-    $stemCount    = $using:stemCount
-    $rawRate      = $using:rawRate
-    $scriptDir    = $using:scriptDir
+    $d                = $_
+    $_dsfPaths        = $using:discDsfPaths        # $using: cannot contain subscript expressions
+    $_wavPaths        = $using:discWavPaths        # capture the list, then index locally
+    $_targetWavBytes  = $using:discTargetWavBytes
+    $discDsfPath      = $_dsfPaths[$d]
+    $discWavPath      = $_wavPaths[$d]
+    $expectedWavBytes = $_targetWavBytes[$d]
+    $discCount        = $using:discCount
+    $stemCount        = $using:stemCount
+    $rawRate          = $using:rawRate
+    $scriptDir        = $using:scriptDir
 
     # $PSNativeCommandUseErrorActionPreference is set at script scope but does NOT
-    # propagate automatically into parallel runspaces. Without it here, dsd2dxd
-    # crashing with a non-zero exit code would be silently ignored — ffmpeg sees EOF,
-    # exits 0, and the script proceeds with a truncated monolithic WAV undetected.
+    # propagate automatically into parallel runspaces. Combined with $ErrorActionPreference = 'Stop'
+    # inside the native pipeline try block below, any non-zero exit from dsd2dxd throws a
+    # terminating exception immediately instead of letting ffmpeg finalize a partial WAV on EOF.
     $PSNativeCommandUseErrorActionPreference = $true
 
     $discLabel = if ($discCount -gt 1) { "Disc $($d+1)/$discCount" } else { 'Album' }
@@ -1418,8 +1551,14 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
     $chanLayout   = $using:chanLayout
     $layoutArgs   = if ($null -ne $chanLayout) { @('-channel_layout', $chanLayout) } else { @() }
     try {
-        dsd2dxd -r $rawRate -b 24 -t E -d T -o S $discDsfPath 2>$null | ffmpeg -hide_banner -v warning -nostats -y -f s24le -ar $rawRate -ac $stemCount @layoutArgs -i pipe:0 -c:a pcm_s24le -rf64 always $discWavPath
-        if ($LASTEXITCODE -ne 0) { throw "Pipeline exited with code $LASTEXITCODE" }
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Stop'
+        try {
+            dsd2dxd -r $rawRate -b 24 -t E -d T -o S $discDsfPath 2>$null | ffmpeg -hide_banner -v warning -nostats -y -f s24le -ar $rawRate -ac $stemCount @layoutArgs -i pipe:0 -c:a pcm_s24le -rf64 always $discWavPath
+            if ($LASTEXITCODE -ne 0) { throw "Pipeline exited with code $LASTEXITCODE" }
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
     } catch {
         Remove-Item -LiteralPath $discWavPath -ErrorAction SilentlyContinue
         Write-Host ""
@@ -1440,11 +1579,8 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
     Write-Host ""
 
     # Apply a 250ms linear fade-out to the tail of every decimated WAV file.
-    # Non-final disc WAVs: suppresses the FIR ringing at the inter-disc 0x69 boundary.
-    # Final (or only) disc WAV: suppresses the 0x69 ringing tail that dsd2dxd produces
-    # at the absolute EOF. Phase 3 FLAC slicing stops at $pcmEnd so is unaffected,
-    # but Phase 4 TrueHD stem demux reads the ENTIRE Album_Monolithic.wav — without
-    # this fade the final seconds of every TrueHD stem would contain a digital pop.
+    # Non-final disc WAVs: suppresses any DSM/FIR tail transient at the inter-disc boundary.
+    # Final (or only) disc WAV: suppresses any DSM turn-off transient at the disc tail.
     #
     # WHY NOT ffmpeg afade?
     #
@@ -1466,12 +1602,13 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                 #   Standard WAV (file < 4 GB, even with -rf64 always on some builds):
                 #     - The 'data' chunk's 32-bit size field holds the real byte count.
                 #
-                # We extract the ds64 dataSize (if present) so that in the RF64 case
-                # we never use $wavStream.Length — which would include any trailing
-                # LIST/INFO metadata chunks ffmpeg appends after the audio payload.
+                # Parse ds64 dataSize as UInt64 with an explicit $hasDs64 flag so an
+                # unfinalized 0xFFFFFFFFFFFFFFFF sentinel is caught rather than coerced
+                # to signed -1 (which would silently fall back to 32-bit 0xFFFFFFFF).
                 $dataOffset  = [int64]-1
                 $dataBytes   = [int64]-1   # authoritative audio byte count
-                $ds64DataSz  = [int64]-1   # parsed from ds64 chunk (RF64 only)
+                $hasDs64     = $false
+                $ds64DataSz  = [uint64]0   # parsed from ds64 chunk (RF64 only)
                 $chunkPos    = [int64]12   # skip 4-byte ID + 4-byte RIFF size + 'WAVE'
                 $walkBuf     = [byte[]]::new(8)
                 while ($chunkPos -lt ($wavStream.Length - 8)) {
@@ -1484,15 +1621,21 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                         # ds64 layout (EBU Tech 3306): riffSize(8) | dataSize(8) | ...
                         # dataSize is at byte offset 8 within the chunk data body.
                         $ds64Buf = [byte[]]::new(16)
-                        [void]$wavStream.Read($ds64Buf, 0, 16)
-                        $ds64DataSz = [BitConverter]::ToInt64($ds64Buf, 8)
+                        $ds64Read = $wavStream.Read($ds64Buf, 0, 16)
+                        if ($ds64Read -lt 16) { throw "Truncated ds64 chunk in RF64 header" }
+                        $ds64DataSz = [BitConverter]::ToUInt64($ds64Buf, 8)
+                        $hasDs64    = $true
                     } elseif ($chunkId -eq 'data') {
                         $dataOffset = $chunkPos + 8
-                        # If ds64 was already parsed, its value takes precedence.
-                        # Otherwise use the 32-bit field (valid for non-RF64 WAV).
-                        if ($ds64DataSz -ge 0) {
-                            $dataBytes = $ds64DataSz
+                        if ($hasDs64) {
+                            if ($ds64DataSz -eq [uint64]::MaxValue) {
+                                throw "ds64 chunk retains unfinalized 0xFFFFFFFFFFFFFFFF sentinel — ffmpeg or dsd2dxd crashed mid-write."
+                            }
+                            $dataBytes = [int64]$ds64DataSz
                         } else {
+                            if ($chunkSize -eq [uint32]::MaxValue) {
+                                throw "WAV data chunk size is 0xFFFFFFFF without a preceding ds64 chunk — corrupt RF64 header."
+                            }
                             $dataBytes = [int64]$chunkSize
                         }
                         break
@@ -1502,19 +1645,24 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                     if ($chunkSize % 2 -ne 0) { $chunkPos++ }
                 }
                 if ($dataOffset -lt 0) { throw "Cannot locate 'data' chunk in RF64/WAV header" }
-                if ($dataBytes  -lt 0) { throw "Cannot determine audio payload size from chunk headers" }
-                # Sentinel / truncation guard: if FFmpeg was killed mid-write, the ds64
-                # dataSize field retains its sentinel value (0xFFFFFFFFFFFFFFFF or similar).
+                if ($dataBytes  -le 0) { throw "Cannot determine valid audio payload size from chunk headers ($dataBytes)" }
                 # Validate the declared payload does not exceed the physical audio region.
-                # A legitimate WAV cannot have more audio bytes than the file holds after
-                # the data chunk header.
                 $physicalAudioBound = $wavStream.Length - $dataOffset
                 if ($dataBytes -gt $physicalAudioBound) {
-                    throw "ds64 declares $dataBytes audio bytes but the file is only $($wavStream.Length) bytes long (data starts at $dataOffset, physical bound = $physicalAudioBound). WAV container is corrupt or was truncated mid-write — refusing to apply fade to a broken file."
+                    throw "ds64 declares $dataBytes audio bytes but the file is only $($wavStream.Length) bytes long (data starts at $dataOffset, physical bound = $physicalAudioBound). WAV container is corrupt or was truncated mid-write."
                 }
 
                 # 24-bit multichannel: bytes per sample frame = channels × 3.
                 $bytesPerFrame = $stemCount * 3
+
+                # Verify decoded PCM payload against the mathematical target derived from
+                # the DSF SampleCount headers. dsd2dxd's Equiripple FIR filter has a 10-frame
+                # startup group-delay / unflushed tail shortfall per disc; allow up to 64 frames
+                # tolerance, and fail loudly if the stream was truncated mid-decimation.
+                if ($expectedWavBytes -gt 0 -and [math]::Abs($expectedWavBytes - $dataBytes) -gt (64 * $bytesPerFrame)) {
+                    throw "Decoded WAV payload ($dataBytes bytes) deviates from expected DSF sample count target ($expectedWavBytes bytes) — dsd2dxd stream was truncated."
+                }
+
                 $fadeSamples   = [int]($rawRate * 0.25)  # 250ms = 24,000 frames at 96kHz
 
                 # Frame count derived from the authoritative audio payload size
@@ -1529,13 +1677,6 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                 $actualFadeBytes = $actualFadeSamples * $bytesPerFrame
 
                 # Read only the fade region.
-                # FileStream.Read() is not guaranteed to return the full request in one
-                # call — the OS may satisfy it in multiple partial reads. More critically,
-                # if the physical file is shorter than the ds64 header claims (truncated
-                # mid-write crash), Read() will reach EOF early and return fewer bytes.
-                # We must capture the actual byte count and only process/write that many
-                # bytes — writing the full allocation back would append zero-filled void
-                # bytes past the physical EOF, corrupting the WAV container irrevocably.
                 $wavStream.Position = $fadeStartByte
                 $fadeBuf = [byte[]]::new($actualFadeBytes)
                 $totalRead = 0
@@ -1567,7 +1708,8 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                 Write-Host "  Native tail fade-out applied ($(Format-N $actualFadeSamples) samples, $(Format-Bytes $totalRead))." -ForegroundColor Green
             } finally { $wavStream.Close() }
         } catch {
-            Write-Host "  [WARN] Native tail fade-out failed: $_" -ForegroundColor Yellow
+            Write-Host "  FATAL: Native tail fade-out / WAV verification failed on $discLabel : $_" -ForegroundColor Red
+            throw $_
         }
 
     # Apply a fixed 5ms linear fade-IN to the head of every non-first disc WAV.
@@ -1603,7 +1745,8 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                 # has no shared state between the two try blocks.
                 $dataOffset = [int64]-1
                 $dataBytes  = [int64]-1
-                $ds64DataSz = [int64]-1
+                $hasDs64    = $false
+                $ds64DataSz = [uint64]0
                 $chunkPos   = [int64]12
                 $walkBuf    = [byte[]]::new(8)
                 while ($chunkPos -lt ($wavStream.Length - 8)) {
@@ -1614,11 +1757,19 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                     $cSize = [BitConverter]::ToUInt32($walkBuf, 4)
                     if ($cId -eq 'ds64') {
                         $ds64Buf = [byte[]]::new(16)
-                        [void]$wavStream.Read($ds64Buf, 0, 16)
-                        $ds64DataSz = [BitConverter]::ToInt64($ds64Buf, 8)
+                        $ds64Read = $wavStream.Read($ds64Buf, 0, 16)
+                        if ($ds64Read -lt 16) { throw "Truncated ds64 chunk in RF64 header" }
+                        $ds64DataSz = [BitConverter]::ToUInt64($ds64Buf, 8)
+                        $hasDs64    = $true
                     } elseif ($cId -eq 'data') {
                         $dataOffset = $chunkPos + 8
-                        $dataBytes  = if ($ds64DataSz -ge 0) { $ds64DataSz } else { [int64]$cSize }
+                        if ($hasDs64) {
+                            if ($ds64DataSz -eq [uint64]::MaxValue) { throw "Unfinalized ds64 sentinel" }
+                            $dataBytes = [int64]$ds64DataSz
+                        } else {
+                            if ($cSize -eq [uint32]::MaxValue) { throw "Invalid 0xFFFFFFFF data size without ds64" }
+                            $dataBytes = [int64]$cSize
+                        }
                         break
                     }
                     $chunkPos += 8 + $cSize
@@ -1646,13 +1797,22 @@ $job = 0..($discCount - 1) | ForEach-Object -Parallel {
                     $totalRead += $r
                 }
 
-                [DspHelper]::FadeIn24Bit($fadeInBuf, $stemCount)
-                $wavStream.Position = $dataOffset
-                $wavStream.Write($fadeInBuf, 0, $totalRead)
+                if ($totalRead -lt $fadeInBytes) {
+                    $fadeInBufActual = [byte[]]::new($totalRead)
+                    [Array]::Copy($fadeInBuf, $fadeInBufActual, $totalRead)
+                    [DspHelper]::FadeIn24Bit($fadeInBufActual, $stemCount)
+                    $wavStream.Position = $dataOffset
+                    $wavStream.Write($fadeInBufActual, 0, $totalRead)
+                } else {
+                    [DspHelper]::FadeIn24Bit($fadeInBuf, $stemCount)
+                    $wavStream.Position = $dataOffset
+                    $wavStream.Write($fadeInBuf, 0, $totalRead)
+                }
                 Write-Host "  Native head fade-in applied ($(Format-N $fadeInSamples) frames / 5ms — mandatory FIR transient shaper)." -ForegroundColor Green
             } finally { $wavStream.Close() }
         } catch {
-            Write-Host "  [WARN] Native head fade-in failed: $_" -ForegroundColor Yellow
+            Write-Host "  FATAL: Native head fade-in failed on $discLabel : $_" -ForegroundColor Red
+            throw $_
         }
     }
         Write-Host ""
@@ -1677,13 +1837,14 @@ if ($discCount -eq 1) {
             $sz    = (Get-Item -LiteralPath $wavPath).Length
             $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
             if ($targetBytes -gt 0) {
-                $pct = [math]::Clamp([int][math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                $maxPct = if ($sz -ge $targetBytes) { 100 } else { 99 }
+                $pct = [math]::Clamp([int][math]::Floor(($sz / $targetBytes) * 100), 0, $maxPct)
                 $szStr = "$szStr ($pct%)"
                 if ($pct -lt 100 -and $ts.TotalSeconds -gt 5) {
                     $speed = $sz / $ts.TotalSeconds
                     if ($speed -gt 0) {
-                        $etaSec = ($targetBytes - $sz) / $speed
-                        $etaStr = "{0}m {1}s" -f [math]::Floor($etaSec / 60), [math]::Round($etaSec % 60)
+                        $etaSec = [int][math]::Round([math]::Max(0.0, ($targetBytes - $sz) / $speed))
+                        $etaStr = "{0}m {1}s" -f [math]::Floor($etaSec / 60), ($etaSec % 60)
                     }
                 } elseif ($pct -ge 100) { $etaStr = "Done" }
             }
@@ -1733,14 +1894,15 @@ if ($discCount -eq 1) {
                     $szStr = $szStr.PadLeft(10)
                     
                     if ($targetBytes -gt 0) {
-                        $pct = [math]::Clamp([int][math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                        $maxPct = if ($sz -ge $targetBytes) { 100 } else { 99 }
+                        $pct = [math]::Clamp([int][math]::Floor(($sz / $targetBytes) * 100), 0, $maxPct)
                         $szStr = "$szStr ($pct%)"
                         if ($pct -lt 100) {
                             $allDone = $false
                             if ($ts.TotalSeconds -gt 5) {
                                 $speed = $sz / $ts.TotalSeconds
                                 if ($speed -gt 0) {
-                                    $eta = ($targetBytes - $sz) / $speed
+                                    $eta = [math]::Max(0.0, ($targetBytes - $sz) / $speed)
                                     if ($eta -gt $maxEtaSec) { $maxEtaSec = $eta }
                                 }
                             }
@@ -1752,20 +1914,25 @@ if ($discCount -eq 1) {
                     $szStr = '  ---  '.PadLeft(10) 
                     $allDone = $false
                 }
-                [Console]::SetCursorPosition(0, $tickerStartRow + $d)
-                $row = "  D$($d+1): $szStr"
-                [Console]::Write($row.PadRight(48))
+                try {
+                    [Console]::SetCursorPosition(0, $tickerStartRow + $d)
+                    $row = "  D$($d+1): $szStr"
+                    [Console]::Write($row.PadRight(48))
+                } catch {}
             }
             
             $etaStr = "..."
             if ($allDone) { $etaStr = "Done" }
             elseif (-not $allMissing -and $ts.TotalSeconds -gt 5) {
-                $etaStr = "{0}m {1}s" -f [math]::Floor($maxEtaSec / 60), [math]::Round($maxEtaSec % 60)
+                $etaRounded = [int][math]::Round($maxEtaSec)
+                $etaStr = "{0}m {1}s" -f [math]::Floor($etaRounded / 60), ($etaRounded % 60)
             }
             
-            [Console]::SetCursorPosition(0, $tickerStartRow + $discCount)
-            [Console]::Write(("  Elapsed: $timeStr  |  ETA: $etaStr").PadRight(48))
-            [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
+            try {
+                [Console]::SetCursorPosition(0, $tickerStartRow + $discCount)
+                [Console]::Write(("  Elapsed: $timeStr  |  ETA: $etaStr").PadRight(48))
+                [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
+            } catch {}
         } else {
             $parts = for ($d = 0; $d -lt $discCount; $d++) {
                 $w = $discWavPaths[$d]
@@ -1775,13 +1942,14 @@ if ($discCount -eq 1) {
                     $sz    = (Get-Item -LiteralPath $w).Length
                     $szStr = if ($sz -ge 1GB) { "$([math]::Round($sz/1GB,2).ToString('0.00')) GiB" } else { "$([math]::Round($sz/1MB,2).ToString('0.00')) MiB" }
                     if ($targetBytes -gt 0) {
-                        $pct = [math]::Clamp([int][math]::Round(($sz / $targetBytes) * 100), 0, 100)
+                        $maxPct = if ($sz -ge $targetBytes) { 100 } else { 99 }
+                        $pct = [math]::Clamp([int][math]::Floor(($sz / $targetBytes) * 100), 0, $maxPct)
                         if ($pct -lt 100) {
                             $allDone = $false
                             if ($ts.TotalSeconds -gt 5) {
                                 $speed = $sz / $ts.TotalSeconds
                                 if ($speed -gt 0) {
-                                    $eta = ($targetBytes - $sz) / $speed
+                                    $eta = [math]::Max(0.0, ($targetBytes - $sz) / $speed)
                                     if ($eta -gt $maxEtaSec) { $maxEtaSec = $eta }
                                 }
                             }
@@ -1800,7 +1968,8 @@ if ($discCount -eq 1) {
             $etaStr = "..."
             if ($allDone) { $etaStr = "Done" }
             elseif (-not $allMissing -and $ts.TotalSeconds -gt 5) {
-                $etaStr = "{0}m {1}s" -f [math]::Floor($maxEtaSec / 60), [math]::Round($maxEtaSec % 60)
+                $etaRounded = [int][math]::Round($maxEtaSec)
+                $etaStr = "{0}m {1}s" -f [math]::Floor($etaRounded / 60), ($etaRounded % 60)
             }
             
             $line = "  Decimating $discCount Discs in Parallel [Elapsed: $timeStr | ETA: $etaStr] [$($parts -join ' | ')]"
@@ -1822,13 +1991,17 @@ if ($discCount -eq 1) {
                 $szStr = $szStr.PadLeft(10)
                 if ($targetBytes -gt 0) { $szStr = "$szStr (100%)" }
             } else { $szStr = 'missing'.PadLeft(10) }
-            [Console]::SetCursorPosition(0, $tickerStartRow + $d)
-            $row = "  D$($d+1): $szStr"
-            [Console]::Write($row.PadRight(48))
+            try {
+                [Console]::SetCursorPosition(0, $tickerStartRow + $d)
+                $row = "  D$($d+1): $szStr"
+                [Console]::Write($row.PadRight(48))
+            } catch {}
         }
-        [Console]::SetCursorPosition(0, $tickerStartRow + $discCount)
-        [Console]::Write(("  Elapsed: $timeStr  |  ETA: Done").PadRight(48))
-        [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
+        try {
+            [Console]::SetCursorPosition(0, $tickerStartRow + $discCount)
+            [Console]::Write(("  Elapsed: $timeStr  |  ETA: Done").PadRight(48))
+            [Console]::SetCursorPosition(0, $tickerStartRow + $discCount + 1)
+        } catch {}
     } else {
         $parts = for ($d = 0; $d -lt $discCount; $d++) {
             $w = $discWavPaths[$d]
@@ -1864,6 +2037,83 @@ if ($job.State -eq 'Failed' -or ($job.ChildJobs | Where-Object { $_.State -eq 'F
     exit 1
 }
 Remove-Job $job
+
+# ── Anchor $trackMap to exact physical frame counts of each disc WAV ─────────
+# Each independent dsd2dxd invocation drops 10 PCM frames (FIR startup group delay
+# + unflushed tail). Anchoring each disc's track boundaries to the actual decoded
+# frame count of DiscN_Monolithic.wav prevents cumulative 10-frame-per-disc drift
+# and guarantees that the final track of Disc D never bleeds into the opening
+# frames of Disc D+1 in Album_Monolithic.wav.
+function Get-WavDataBytes {
+    param([string]$WavPath)
+    $ws = [System.IO.FileStream]::new($WavPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $hasDs64    = $false
+        $ds64DataSz = [uint64]0
+        $chunkPos   = [int64]12
+        $walkBuf    = [byte[]]::new(8)
+        while ($chunkPos -lt ($ws.Length - 8)) {
+            $ws.Position = $chunkPos
+            $br = $ws.Read($walkBuf, 0, 8)
+            if ($br -lt 8) { break }
+            $cId   = [System.Text.Encoding]::ASCII.GetString($walkBuf, 0, 4)
+            $cSize = [BitConverter]::ToUInt32($walkBuf, 4)
+            if ($cId -eq 'ds64') {
+                $ds64Buf = [byte[]]::new(16)
+                $ds64Read = $ws.Read($ds64Buf, 0, 16)
+                if ($ds64Read -lt 16) { throw "Truncated ds64 chunk in '$WavPath'" }
+                $ds64DataSz = [BitConverter]::ToUInt64($ds64Buf, 8)
+                $hasDs64    = $true
+            } elseif ($cId -eq 'data') {
+                if ($hasDs64) {
+                    if ($ds64DataSz -eq [uint64]::MaxValue) { throw "Unfinalized ds64 sentinel in '$WavPath'" }
+                    return [int64]$ds64DataSz
+                } else {
+                    if ($cSize -eq [uint32]::MaxValue) { throw "Invalid 0xFFFFFFFF data size without ds64 in '$WavPath'" }
+                    return [int64]$cSize
+                }
+            }
+            $chunkPos += 8 + $cSize
+            if ($cSize % 2 -ne 0) { $chunkPos++ }
+        }
+        throw "Cannot locate 'data' chunk in '$WavPath'"
+    } finally { $ws.Close() }
+}
+
+if ($albumSampleHz -gt 0 -and $trackMap.Count -gt 0) {
+    $bytesPerFrame    = $stemCount * 3
+    $discBasePcmFrame = [uint64]0
+    for ($d = 0; $d -lt $discCount; $d++) {
+        $discWavDataBytes = Get-WavDataBytes $discWavPaths[$d]
+        $discActualFrames = [uint64][math]::Floor($discWavDataBytes / $bytesPerFrame)
+        $discTracks       = $discGroups[$d]
+        $discDsdCursor    = [uint64]0
+
+        for ($t = 0; $t -lt $discTracks.Count; $t++) {
+            $trk   = $discTracks[$t]
+            $entry = $trackMap | Where-Object { $_.DsfPath -eq $trk.FullName } | Select-Object -First 1
+            if ($entry) {
+                $relDsdStart = $discDsdCursor
+                $relDsdEnd   = $discDsdCursor + $entry.DsfSamples
+                $discDsdCursor = $relDsdEnd
+
+                $relPcmStart = [ulong][System.Numerics.BigInteger]::Divide(([bigint]$relDsdStart * $PCM_RATE), [bigint]$albumSampleHz)
+                $relPcmEnd   = [ulong][System.Numerics.BigInteger]::Divide(([bigint]$relDsdEnd   * $PCM_RATE), [bigint]$albumSampleHz)
+
+                # Clamp to the physical disc boundary (absorbs dsd2dxd's 10-frame FIR
+                # tail shortfall on the final track of the disc without bleeding into Disc D+1).
+                if ($relPcmStart -gt $discActualFrames) { $relPcmStart = $discActualFrames }
+                if ($t -eq ($discTracks.Count - 1) -or $relPcmEnd -gt $discActualFrames) {
+                    $relPcmEnd = $discActualFrames
+                }
+
+                $entry.PcmStart = $discBasePcmFrame + $relPcmStart
+                $entry.PcmEnd   = $discBasePcmFrame + $relPcmEnd
+            }
+        }
+        $discBasePcmFrame += $discActualFrames
+    }
+}
 
 # ── Concatenate per-disc RF64 files → Album_Monolithic.wav (multi-disc only) ──
 if ($discCount -gt 1) {
@@ -2184,7 +2434,7 @@ if ($runTrueHD) {
     Write-Host " ── Phase 4: TrueHD Stem Routing ───────────────────────────" -ForegroundColor DarkCyan
     Write-Host ""
 
-    # Switch on the authoritative Scarlet Book channel type rather than the raw stem count.
+    # Switch on the authoritative Sony DSF channel type (1–7) rather than the raw stem count.
     # This guarantees accurate stem naming for ambiguous counts (e.g. 4ch = Quad OR 3.1).
     $chanNames = switch ($channelType) {
         1 { @('C') }                                   # Mono
@@ -2194,7 +2444,6 @@ if ($runTrueHD) {
         5 { @('L','R','C','LFE') }                     # 3.1
         6 { @('L','R','C','Ls','Rs') }                 # 5.0
         7 { @('L','R','C','LFE','Ls','Rs') }           # 5.1
-        9 { @('L','R','C','LFE','Lb','Rb','Ls','Rs') } # 7.1
         # 'CHAN{0:D2}' requires PowerShell's -f operator to expand the placeholder.
         # Without it, every stem would be written as 'CHAN{0:D2}.wav' literally.
         default { 0..($stemCount-1) | ForEach-Object { 'CHAN{0:D2}' -f $_ } }
@@ -2212,7 +2461,9 @@ if ($runTrueHD) {
         # in FFmpeg 6.0+, causing an immediate fatal "Option channel_layout not found"
         # error on modern builds. pan=1c|c0=cN is the backwards-compatible equivalent:
         # it routes exactly one input channel (index $c) to a mono output channel.
-        $ffStemArgs.AddRange([string[]]@('-map','0:a:0','-filter:a',"pan=1c|c0=c$c",'-c:a',$STEM_CODEC,'-map_metadata','-1',$outFile))
+        # -rf64 auto keeps stems < 4 GiB as standard RIFF WAV for Dolby Media Producer /
+        # Cavernize compatibility while upgrading 4+ hour box-set stems to RF64 automatically.
+        $ffStemArgs.AddRange([string[]]@('-map','0:a:0','-filter:a',"pan=1c|c0=c$c",'-c:a',$STEM_CODEC,'-rf64','auto','-map_metadata','-1',$outFile))
     }
 
     Write-Host ""
@@ -2284,33 +2535,7 @@ if ($runTrueHD) {
     $dataBytes = [int64]-1
     if (Test-Path -LiteralPath $monolithWav) {
         try {
-            $wavStream = [System.IO.FileStream]::new($monolithWav, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
-            try {
-                $ds64DataSz = [int64]-1
-                $chunkPos   = [int64]12
-                $walkBuf    = [byte[]]::new(8)
-                while ($chunkPos -lt ($wavStream.Length - 8)) {
-                    $wavStream.Position = $chunkPos
-                    $bytesRead = $wavStream.Read($walkBuf, 0, 8)
-                    if ($bytesRead -lt 8) { break }
-                    $chunkId   = [System.Text.Encoding]::ASCII.GetString($walkBuf, 0, 4)
-                    $chunkSize = [BitConverter]::ToUInt32($walkBuf, 4)
-                    if ($chunkId -eq 'ds64') {
-                        $ds64Buf = [byte[]]::new(16)
-                        [void]$wavStream.Read($ds64Buf, 0, 16)
-                        $ds64DataSz = [BitConverter]::ToInt64($ds64Buf, 8)
-                    } elseif ($chunkId -eq 'data') {
-                        if ($ds64DataSz -ge 0) {
-                            $dataBytes = $ds64DataSz
-                        } else {
-                            $dataBytes = [int64]$chunkSize
-                        }
-                        break
-                    }
-                    $chunkPos += 8 + $chunkSize
-                    if ($chunkSize % 2 -ne 0) { $chunkPos++ }
-                }
-            } finally { $wavStream.Close() }
+            $dataBytes = Get-WavDataBytes $monolithWav
         } catch {
             Write-Host "  [WARN] Failed to parse WAV header: $_" -ForegroundColor Yellow
         }
@@ -2353,16 +2578,17 @@ if ($runTrueHD) {
         $metaLines.Add(";FFMETADATA1")
         $metaLines.Add("title=Album Video")
         for ($i = 0; $i -lt $trackMap.Count; $i++) {
-            $entry = $trackMap[$i]
-            $startMs = [math]::Round(($entry.PcmStart / $PCM_RATE) * 1000)
-            $endMs = [math]::Round(($entry.PcmEnd / $PCM_RATE) * 1000)
-            $rawTitle  = Get-ChapterTitle $entry.Name
+            $entry        = $trackMap[$i]
+            $rawTitle     = Get-ChapterTitle $entry.Name
+            # Escape FFMETADATA1 special characters (=, ;, #, \) so track titles
+            # containing "#" (e.g. "Prelude #1") or ";" are not truncated as comments.
+            $escapedTitle = $rawTitle -replace '([=;#\\])', '\$1'
 
             $metaLines.Add("[CHAPTER]")
-            $metaLines.Add("TIMEBASE=1/1000")
-            $metaLines.Add("START=$startMs")
-            $metaLines.Add("END=$endMs")
-            $metaLines.Add("title=$rawTitle")
+            $metaLines.Add("TIMEBASE=1/$PCM_RATE")
+            $metaLines.Add("START=$($entry.PcmStart)")
+            $metaLines.Add("END=$($entry.PcmEnd)")
+            $metaLines.Add("title=$escapedTitle")
         }
         [System.IO.File]::WriteAllLines($metaFile, $metaLines, [System.Text.UTF8Encoding]::new($false))
     } catch {
@@ -2410,6 +2636,7 @@ if ($runTrueHD) {
     # 2. If seed video was generated successfully, infinitely loop-copy it using the stream copy demuxer.
     # This runs at pure disk I/O speeds (instantaneous) and maps the FFMETADATA1 chapters.
     # Disables global/stream metadata tags while preserving chapters, and sets the video stream disposition as default.
+    $ffLoopExit = 1
     if ($seedSuccess -and (Test-Path -LiteralPath $tempBlack)) {
         $ffLoopArgs = @(
             '-hide_banner','-v','error','-y',
@@ -2425,13 +2652,12 @@ if ($runTrueHD) {
             $videoFile
         )
         $videoOut = & ffmpeg @ffLoopArgs 2>&1
-        if ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $videoFile)) {
+        $ffLoopExit = $LASTEXITCODE
+        if ($ffLoopExit -eq 0 -and (Test-Path -LiteralPath $videoFile)) {
             if (Get-Command mkvpropedit -ErrorAction SilentlyContinue) {
                 & mkvpropedit $videoFile --tags all: 2>&1 | Out-Null
             }
         }
-    } else {
-        $LASTEXITCODE = 1
     }
 
     $videoTimer.Stop()
@@ -2440,8 +2666,8 @@ if ($runTrueHD) {
     Remove-Item -LiteralPath $tempBlack -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $metaFile -Force -ErrorAction SilentlyContinue
 
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "  [WARN] ffmpeg black video generation failed (exit $LASTEXITCODE)." -ForegroundColor Yellow
+    if ($ffLoopExit -ne 0) {
+        Write-Host "  [WARN] ffmpeg black video generation failed (exit $ffLoopExit)." -ForegroundColor Yellow
         if ($videoOut) { $videoOut | ForEach-Object { Write-Host "    >> $_" -ForegroundColor DarkRed } }
     } else {
         $videoSize = (Get-Item -LiteralPath $videoFile).Length
